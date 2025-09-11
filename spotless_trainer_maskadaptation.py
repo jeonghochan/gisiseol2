@@ -95,7 +95,7 @@ class Config:
     # Initial scale of GS
     init_scale: float = 1.0
     # Weight for SSIM loss
-    ssim_lambda: float = 0.3
+    ssim_lambda: float = 0.0
     # Loss types: l1, robust
     loss_type: str = "robust"
     # Robust loss percentile for threshold
@@ -525,6 +525,13 @@ class Runner:
         pred_mask = inlier_sf.squeeze(0).unsqueeze(-1)
         return pred_mask
 
+    #revised
+    def get_ssim_lambda(step, cfg):
+                ramp_end = int(0.5 * cfg.max_steps) 
+                t = min(step / max(ramp_end, 1), 1.0)
+                wt = 0.5 - 0.5 * math.cos(math.pi * t) 
+                return wt * cfg.ssim_lambda
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -719,7 +726,7 @@ class Runner:
                         sf_flat = sf.reshape(sf.shape[0], -1).permute((1, 0))
                         self.spotless_module.eval()
                         pred_mask_up = self.spotless_module(sf_flat)
-                        pred_mask = pred_mask_up.reshape(
+                        pred_mask = pred_mask_up.reshape(  # mlp predicted mask
                             1, colors.shape[1], colors.shape[2], 1
                         )
                         
@@ -736,14 +743,15 @@ class Runner:
                             max=1.0,
                         )
                     )
-            
-
+            #revised
+            #coscine scheduling for ssim_lambda
+            curr_ssim_lambda = self.get_ssim_lambda(step, cfg)
 
             # loss definition
-            rgbloss = (pred_mask.clone().detach() * binary_mask).mean()
+            rgbloss = (binary_mask * error_per_pixel).mean()
             ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
             #total loss
-            loss = rgbloss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            loss = rgbloss * (1.0 - curr_ssim_lambda) + ssimloss * curr_ssim_lambda
 
             
 
@@ -778,7 +786,7 @@ class Runner:
                     gt_inlier = binary_mask 
 
                     bce = F.binary_cross_entropy(pred_prob, gt_inlier)
-                    spot_loss = cfg.mlp_gt_lambda * bce
+                    spot_loss = cfg.mlp_gt_lambda * bce  # hard coded to 1.0
 
                 reg = 0.3 * self.spotless_module.get_regularizer()
                 spot_loss = spot_loss + reg
@@ -1306,7 +1314,6 @@ class Runner:
 
 
 
-            
         masked_psnr = torch.stack(metrics["MASK_psnr"]).mean()
         masked_ssim = torch.stack(metrics["MASK_ssim"]).mean()
         masked_lpips = torch.stack(metrics["MASK_lpips"]).mean()
