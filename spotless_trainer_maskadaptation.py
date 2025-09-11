@@ -74,11 +74,11 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 300
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [70, 300])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [70, 300])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -677,7 +677,7 @@ class Runner:
                 if mask_tensor.shape[1] != colors.shape[1] or mask_tensor.shape[2] != colors.shape[2]:
                     mask_tensor = F.interpolate(mask_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
                     mask_tensor = mask_tensor.permute(0, 2, 3, 1)
-                binary_mask = 1.0 -  mask_tensor.to(device) # 1 for background, 0 for foreground
+                binary_mask = 1.0 -  mask_tensor.to(device) # 1 for background, 0 for dynamic object
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
@@ -1211,7 +1211,7 @@ class Runner:
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
         ellipse_time = 0
-        metrics = {"psnr": [], "ssim": [], "lpips": []}
+        metrics = {"psnr": [], "ssim": [], "lpips": [], "MASK_psnr": [], "MASK_ssim": [], "MASK_lpips": []}
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -1250,21 +1250,23 @@ class Runner:
 
             #revised 0910
             # test mask saved
+            test_binary_mask = None
+
             if self.mask_dir:
                 mpath = self.mask_dict.get(test_mask_name, None)
-                mdst_dir = Path(self.cfg.result_dir) / "test" / "mask"
-                mdst_dir.mkdir(parents=True, exist_ok=True)
+                test_mdst_dir = Path(self.cfg.result_dir) / "test" / "mask"
+                test_mdst_dir.mkdir(parents=True, exist_ok=True)
                 if mpath:
-                    mdst = mdst_dir / mpath.name
+                    mdst = test_mdst_dir / mpath.name
                     shutil.copy(mpath, mdst)
                 else:
                     raise FileNotFoundError(f"Mask not found for '{test_mask_name}' in mask_dir.")
 
                 # mask load and process
-                mask_img = imageio.imread(mpath)
-                if mask_img.ndim == 3:
+                test_mask_img = imageio.imread(mpath)
+                if test_mask_img.ndim == 3:
                     print("[WARN] mask image has 3 channels, converting to grayscale")
-                    mask_img = mask_img[..., 0]
+                    test_mask_img = test_mask_img[..., 0]
                 orig_imsize = self.parser.imsize_dict.get(name)
                 if orig_imsize is not None:
                     h0, w0 = orig_imsize
@@ -1272,43 +1274,49 @@ class Runner:
                     h1, w1 = h0 // factor, w0 // factor
                 else:
                     h1, w1 = colors.shape[1], colors.shape[2]
-                mask_img_resized = cv2.resize(mask_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
-                mask_tensor = torch.from_numpy(mask_img_resized).float() / 255.0
-                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(-1)
-                if mask_tensor.shape[1] != colors.shape[1] or mask_tensor.shape[2] != colors.shape[2]:
-                    mask_tensor = F.interpolate(mask_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
-                    mask_tensor = mask_tensor.permute(0, 2, 3, 1)
-                binary_mask = mask_tensor.to(device)
-                binary_mask = binary_mask.permute(0, 3, 1, 2)
-                binary_mask = binary_mask.expand(-1, 3, -1, -1)
-                binary_mask = 1.0 - binary_mask  # 1 for background, 0 for foreground
-
-
+                test_mask_img_resized = cv2.resize(test_mask_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
+                test_mask_tensor = torch.from_numpy(test_mask_img_resized).float() / 255.0
+                test_mask_tensor = test_mask_tensor.unsqueeze(0).unsqueeze(-1)
+                
+                if test_mask_tensor.shape[1] != colors.shape[1] or test_mask_tensor.shape[2] != colors.shape[2]:
+                    test_mask_tensor = F.interpolate(test_mask_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
+                    test_mask_tensor = test_mask_tensor.permute(0, 2, 3, 1)
+                test_binary_mask = test_mask_tensor.to(device)
+                test_binary_mask = test_binary_mask.permute(0, 3, 1, 2)
+                test_binary_mask = test_binary_mask.expand(-1, 3, -1, -1)
+                test_binary_mask = 1.0 - test_binary_mask  # 1 for background, 0 for foreground
+                print("test_binary_mask unique:", torch.unique(test_binary_mask))
+                print("test_binary_mask mean:", test_binary_mask.mean())
+                print("test_binary_mask shape:", test_binary_mask.shape)
+            
+            
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
 
             metrics["psnr"].append(self.psnr(colors, pixels))
             metrics["ssim"].append(self.ssim(colors, pixels))
             metrics["lpips"].append(self.lpips(colors, pixels))
-
-
+            
             # test metrics with mask applied
-            masked_pixels = pixels * binary_mask
-            masked_colors = colors * binary_mask
-            metrics["psnr"].append(self.psnr(masked_colors, masked_pixels))
-            metrics["ssim"].append(self.ssim(masked_colors, masked_pixels))     
-            metrics["lpips"].append(self.lpips(masked_colors, masked_pixels))
+            masked_pixels = pixels * test_binary_mask
+            masked_colors = colors * test_binary_mask
+            metrics["MASK_psnr"].append(self.psnr(masked_colors, masked_pixels))
+            metrics["MASK_ssim"].append(self.ssim(masked_colors, masked_pixels))     
+            metrics["MASK_lpips"].append(self.lpips(masked_colors, masked_pixels))
 
-        masked_psnr = torch.stack(metrics["psnr"]).mean()
-        masked_ssim = torch.stack(metrics["ssim"]).mean()
-        masked_lpips = torch.stack(metrics["lpips"]).mean()
+
+
+            
+        masked_psnr = torch.stack(metrics["MASK_psnr"]).mean()
+        masked_ssim = torch.stack(metrics["MASK_ssim"]).mean()
+        masked_lpips = torch.stack(metrics["MASK_lpips"]).mean()
 
         ellipse_time /= len(valloader)
 
         print("")
         print("[EVAL] TEST rendered image WITH MASK metrics")
         print(
-            f"PSNR: {masked_psnr.item():.9f}, SSIM: {masked_ssim.item():.9f}, LPIPS: {masked_lpips.item():.9f} "
+            f"MASK_PSNR: {masked_psnr.item():.9f}, MASK_SSIM: {masked_ssim.item():.9f}, MASK_LPIPS: {masked_lpips.item():.9f} "
             f"Time: {ellipse_time:.9f}s/image "
             f"Number of GS: {len(self.splats['means3d'])}"
             )    
