@@ -526,7 +526,7 @@ class Runner:
         return pred_mask
 
     #revised
-    def get_ssim_lambda(step, cfg):
+    def get_ssim_lambda(self, step:int) -> float:
                 ramp_end = int(0.5 * cfg.max_steps) 
                 t = min(step / max(ramp_end, 1), 1.0)
                 wt = 0.5 - 0.5 * math.cos(math.pi * t) 
@@ -745,7 +745,7 @@ class Runner:
                     )
             #revised
             #coscine scheduling for ssim_lambda
-            curr_ssim_lambda = self.get_ssim_lambda(step, cfg)
+            curr_ssim_lambda = self.get_ssim_lambda(step)
 
             # loss definition
             rgbloss = (binary_mask * error_per_pixel).mean()
