@@ -34,6 +34,7 @@ from utils import (
 )
 
 from gsplat.rendering import rasterization
+# from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead
 
 
 @dataclass
@@ -181,9 +182,17 @@ class Config:
     #revised
     #mask directory
     mask_dir: Optional[str] = None
+    #someday to change 
+    # seed : int = 42
 
     # Weight for MLP mask loss
-    mlp_gt_lambda: float = 1.0
+    # revised-0913
+    mlp_gt_lambda: float = 0.1
+    mlp_teacher_mix_start: int = 0
+    mlp_teacher_mix_end:   int = 10_000
+    mlp_teacher_gt_start:  float = 1.0   # w(0)
+    mlp_teacher_gt_end:    float = 0.5   # w(T)
+    mlp_dice_lambda:       float = 0.2
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -262,6 +271,29 @@ def create_splats_with_optimizers(
         for name, _, lr in params
     ]
     return splats, optimizers
+
+#revised-0913
+class DinoUpsampleHead(nn.Module):
+    def __init__(self, in_ch: int, mid_ch: int = 256, stages: int = 3):
+        super().__init__()
+        def blk(cin, cout):
+            return nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(cin, cout, 3, padding=1),
+                nn.GroupNorm(1, cout),   # LayerNorm([C,H,W]) 대신 안전
+                nn.GELU(),
+            )
+        layers, c = [], in_ch
+        for _ in range(stages):
+            layers.append(blk(c, mid_ch)); c = mid_ch
+        self.stem = nn.Sequential(*layers)
+        self.proj = nn.Conv2d(mid_ch, in_ch, 1)
+
+    def forward(self, x):                 # x: [B, C, Th, Tw]
+        y = self.stem(x)
+        return self.proj(y)               # -> [B, C, H*, W*]
+
+
 
 
 class Runner:
@@ -400,15 +432,16 @@ class Runner:
             self.spotless_module = SpotLessModule(
                 num_classes=1, num_features=self.trainset[0]["semantics"].shape[0] + 80
             ).cuda()
+
+
             self.spotless_optimizers = [
                 torch.optim.Adam(
                     self.spotless_module.parameters(),
                     lr=1e-3,
                 )
             ]
-            self.spotless_loss = lambda p, minimum, maximum: torch.mean(
-                torch.nn.ReLU()(p - minimum) + torch.nn.ReLU()(maximum - p)
-            )
+            # self.spotless_loss = lambda p, minimum, maximum: torch.mean(
+            #     torch.nn.ReLU()(p - minimum) + torch.nn.ReLU()(maximum - p))
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -778,18 +811,55 @@ class Runner:
 
             loss.backward()
             
+
+
+
+
             # sls-mlp trainer
             if self.mlp_spotless:
                 self.spotless_module.train()
+
+                #revised-0913
+                #ablation study1 w cosine scheduling
+                # T0, T1 = cfg.mlp_teacher_mix_start, cfg.mlp_teacher_mix_end
+                # if step <= T0:    w = cfg.mlp_teacher_gt_start
+                # elif step >= T1:  w = cfg.mlp_teacher_gt_end
+                # else:
+                #     tau = (step - T0) / max(T1 - T0, 1)
+                #     w = cfg.mlp_teacher_gt_end + 0.5*(cfg.mlp_teacher_gt_start - cfg.mlp_teacher_gt_end)*(1 + math.cos(math.pi*tau))
+                
+                w = 0.5  #ablation study2 w is 0.5 fixed
+                teacher = torch.clamp(w * binary_mask + (1.0 - w) * pred_mask.detach(), 0.0, 1.0)
+
+
                 if binary_mask is not None:
-                    pred_prob = pred_mask_up.reshape(1, colors.shape[1], colors.shape[2], 1)
-                    gt_inlier = binary_mask 
+                    pred_prob = pred_mask_up.reshape(1, colors.shape[1], colors.shape[2], 1) # pred_mask from mlp--like noise!
+                    # gt_inlier = binary_mask 
 
-                    bce = F.binary_cross_entropy(pred_prob, gt_inlier)
-                    spot_loss = cfg.mlp_gt_lambda * bce  # hard coded to 1.0
+                    bce = F.binary_cross_entropy(pred_prob, teacher)
+                    # bce_dynamic = F.binary_cross_entropy(pred_prob*(1-binary_mask),1-binary_mask)
 
-                reg = 0.3 * self.spotless_module.get_regularizer()
-                spot_loss = spot_loss + reg
+                    if cfg.mlp_dice_lambda > 0:
+                        eps = 1e-6
+                        inter = (pred_prob * teacher).sum()
+                        dice = 1.0 - (2*inter + eps) / (pred_prob.sum() + teacher.sum() + eps) # Dice loss means 1 - Dice coeff
+                        bce = bce + cfg.mlp_dice_lambda * dice
+
+                        # ablation study3 doublemask
+                        # dy_inter = (pred_prob * (1-binary_mask)).sum()
+                        # dy_dice = 1.0 - (2*dy_inter + eps) / (pred_prob*(1-binary_mask)).sum() + (1-binary_mask).sum() + eps
+                        # bce_dynamic = bce_dynamic + cfg.mlp_dice_lambda * dy_dice
+
+                        # bce = bce + bce_dynamic
+
+                    spot_loss = cfg.mlp_gt_lambda * bce + 0.3 * self.spotless_module.get_regularizer() #mlp_gt_lambda = 1.0 hard coded
+
+
+                    # bce = F.binary_cross_entropy(pred_prob, gt_inlier)
+                    # spot_loss = cfg.mlp_gt_lambda * bce  # hard coded to 1.0
+
+                # reg = 0.3 * self.spotless_module.get_regularizer()
+                # spot_loss = spot_loss + reg
                 spot_loss.backward()
 
             # Pass the error histogram for capturing error statistics
