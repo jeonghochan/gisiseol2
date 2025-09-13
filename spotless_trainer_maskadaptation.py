@@ -118,7 +118,7 @@ class Config:
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.005
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float = 0.0006  #0.0002 #revised
+    grow_grad2d: float = 0.0002 
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
@@ -127,11 +127,11 @@ class Config:
     # Start refining GSs after this iteration
     refine_start_iter: int = 500
     # Stop refining GSs after this iteration
-    refine_stop_iter: int = 8000 #15_000 revised
+    refine_stop_iter: int = 15000
     # Reset opacities every this steps
     reset_every: int = 300000
     # Refine GSs every this steps
-    refine_every: int = 250 #100  revised
+    refine_every: int = 100
     # Reset SH specular coefficients once
     reset_sh: int = 8002
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -1293,9 +1293,9 @@ class Runner:
                 test_binary_mask = test_binary_mask.permute(0, 3, 1, 2)
                 test_binary_mask = test_binary_mask.expand(-1, 3, -1, -1)
                 test_binary_mask = 1.0 - test_binary_mask  # 1 for background, 0 for foreground
-                print("test_binary_mask unique:", torch.unique(test_binary_mask))
-                print("test_binary_mask mean:", test_binary_mask.mean())
-                print("test_binary_mask shape:", test_binary_mask.shape)
+                # print("test_binary_mask unique:", torch.unique(test_binary_mask))
+                # print("test_binary_mask mean:", test_binary_mask.mean())
+                # print("test_binary_mask shape:", test_binary_mask.shape)
             
             
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
