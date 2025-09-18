@@ -34,7 +34,7 @@ from utils import (
 )
 
 from gsplat.rendering import rasterization
-# from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead
+from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead
 
 
 @dataclass
@@ -119,7 +119,7 @@ class Config:
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.005
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float = 0.0002 
+    grow_grad2d: float =  0.0008 #0.0002 
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
@@ -184,12 +184,13 @@ class Config:
     mask_dir: Optional[str] = None
     #someday to change 
     # seed : int = 42
+    pseudo_gt_dir: Optional[str] = None  # temporary directory for pseudo GT
 
     # Weight for MLP mask loss
     # revised-0913
     mlp_gt_lambda: float = 0.1
-    mlp_teacher_mix_start: int = 0
-    mlp_teacher_mix_end:   int = 10_000
+    mlp_teacher_mix_start: int = 5000
+    mlp_teacher_mix_end:   int = 15_000
     mlp_teacher_gt_start:  float = 1.0   # w(0)
     mlp_teacher_gt_end:    float = 0.5   # w(T)
     mlp_dice_lambda:       float = 0.2
@@ -272,29 +273,6 @@ def create_splats_with_optimizers(
     ]
     return splats, optimizers
 
-#revised-0913
-class DinoUpsampleHead(nn.Module):
-    def __init__(self, in_ch: int, mid_ch: int = 256, stages: int = 3):
-        super().__init__()
-        def blk(cin, cout):
-            return nn.Sequential(
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                nn.Conv2d(cin, cout, 3, padding=1),
-                nn.GroupNorm(1, cout),   # LayerNorm([C,H,W]) 대신 안전
-                nn.GELU(),
-            )
-        layers, c = [], in_ch
-        for _ in range(stages):
-            layers.append(blk(c, mid_ch)); c = mid_ch
-        self.stem = nn.Sequential(*layers)
-        self.proj = nn.Conv2d(mid_ch, in_ch, 1)
-
-    def forward(self, x):                 # x: [B, C, Th, Tw]
-        y = self.stem(x)
-        return self.proj(y)               # -> [B, C, H*, W*]
-
-
-
 
 class Runner:
     """Engine for training and testing."""
@@ -327,6 +305,16 @@ class Runner:
                     key = mfile.stem.replace("_extra", "").replace("_clutter", "")
                     self.mask_dict[key] = mfile
 
+        #revised-0917
+        self.pseudo_gt_dir = cfg.pseudo_gt_dir
+        self.pseudo_gt_dict = {}
+        if self.pseudo_gt_dir:
+            src_root = Path(self.pseudo_gt_dir)
+            for pfile in src_root.rglob("*.*"):
+                if pfile.is_file():
+                    key = pfile.stem.replace("_pseudo_gt", "")
+                    self.pseudo_gt_dict[key] = pfile
+        
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
@@ -564,6 +552,45 @@ class Runner:
                 t = min(step / max(ramp_end, 1), 1.0)
                 wt = 0.5 - 0.5 * math.cos(math.pi * t) 
                 return wt * cfg.ssim_lambda
+    #revised-0918
+    def masked_ssim(img1, img2, mask, window_size=11, C1=0.01**2, C2=0.03**2):
+        """
+        img1, img2: [B,1,H,W] or [B,3,H,W] (0~1 normalized)
+        mask:       [B,1,H,W] binary mask (1=valid, 0=ignore)
+        """
+        # 윈도우: Gaussian 대신 uniform 사용 가능
+        window = torch.ones((1,1,window_size,window_size), device=img1.device) / (window_size**2)
+        
+        def filt(x): return F.conv2d(x, window, padding=window_size//2, groups=x.shape[1])
+        
+        # 마스크 normalization
+        M = filt(mask)
+        M = torch.clamp(M, min=1e-6)  # 0 division 방지
+
+        mu1 = filt(img1*mask) / M
+        mu2 = filt(img2*mask) / M
+
+        sigma1_sq = filt((img1*mask)**2) / M - mu1**2
+        sigma2_sq = filt((img2*mask)**2) / M - mu2**2
+        sigma12   = filt((img1*img2*mask)) / M - mu1*mu2
+
+        ssim_map = ((2*mu1*mu2 + C1) * (2*sigma12 + C2)) / \
+                ((mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2))
+
+        # SSIM 평균도 마스크 영역으로 한정
+        return (ssim_map*mask).sum() / mask.sum()
+
+    def masked_psnr(pred, gt, mask, max_val=1.0):
+        """
+        to only calculate activated pixels with psnr, cannot use pre-built psnr func
+        because there can be include 0 in denominator
+        """
+        m = mask.expand_as(pred)
+        mse = ((pred - gt)**2 * m).sum(dim=(1,2,3)) / (m.sum(dim=(1,2,3)) + 1e-8)
+        psnr = 10.0 * torch.log10((max_val**2) / (mse + 1e-12))
+        return psnr  # [B]
+
+
 
     def train(self):
         cfg = self.cfg
@@ -687,6 +714,27 @@ class Runner:
             imageio.imwrite(os.path.join(rend_train_dir, name), rend_np)
 
             binary_mask = None
+            
+            #revised-0917
+            pseudo_gt = None
+
+            if self.pseudo_gt_dir:
+                pseudo_gt_path = self.pseudo_gt_dict.get(mask_name, None)
+                pseudo_gt_img = imageio.imread(pseudo_gt_path) # take same pseudo gt : 이 부분은 나중에 없어져야 함 sam2로 대체
+                orig_imsize = self.parser.imsize_dict.get(name)
+                if orig_imsize is not None:
+                    h0, w0 = orig_imsize
+                    factor = self.cfg.data_factor
+                    h1, w1 = h0 // factor, w0 // factor
+                pseudo_gt_resized = cv2.resize(pseudo_gt_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
+                pseudo_gt_tensor = torch.from_numpy(pseudo_gt_resized).float() / 255.0
+                pseudo_gt_tensor = pseudo_gt_tensor.unsqueeze(0).unsqueeze(-1)
+                if pseudo_gt_tensor.shape[1] != colors.shape[1] or pseudo_gt_tensor.shape[2] != colors.shape[2]:
+                    pseudo_gt_tensor = F.interpolate(pseudo_gt_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
+                    pseudo_gt_tensor = pseudo_gt_tensor.permute(0, 2, 3, 1)
+                pseudo_gt = pseudo_gt_tensor.to(device) 
+
+
 
             # --- 마스크 딕셔너리에서 바로 lookup ---
             if self.mask_dir:
@@ -776,17 +824,81 @@ class Runner:
                             max=1.0,
                         )
                     )
-            #revised
+
+            #revised-0913-3
+            # ------------------------------------------------------------------------------------
+            # # 0) lazy init (한 번만 만들기)
+            # if not hasattr(self, "dino_extractor"):
+            #     self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
+            # if not hasattr(self, "dino_head"):
+            #     # DINO 토큰(저해상도) -> 픽셀 해상도로 올리는 경량 업샘플 헤드
+            #     self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
+
+            # # 1) DINO 토큰 추출 (GT/Render)  **no no_grad()**  ← 그래디언트가 colors까지 흘러가야 함
+            # gt_chw     = pixels.permute(0, 3, 1, 2)    # [B,3,H,W], GT
+
+            # render_chw = colors.permute(0, 3, 1, 2)    # [B,3,H,W], 렌더 결과
+            # mask_chw = binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W], 마스크
+            # render_chw_safe = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw) # 마스크 영역은 렌더링 그래디언트가 안 흐르도록 처리
+
+            # ftok  = self.dino_extractor.extract_tokens(gt_chw)      # [B,Th*Tw,C] (백본 파라미터는 require_grad=False로 freeze)
+            # fhtok = self.dino_extractor.extract_tokens(render_chw)  # [B,Th*Tw,C]
+
+            # with torch.no_grad():  
+            #     ftok,  Th, Tw, _, _  = self.dino_extractor.extract_tokens(gt_chw)      
+            # fhtok, Th2, Tw2, _, _  = self.dino_extractor.extract_tokens(render_chw_safe)  
+            # assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
+            # B, _, C = ftok.shape
+
+            # f_gt  = ftok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()   # [B,C,Th,Tw]
+            # f_rnd = fhtok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()  # [B,C,Th,Tw]
+
+
+            # # 2) 업샘플 → 이미지 해상도 정렬
+            # ps = self.dino_extractor.patch_size
+            # Hpad, Wpad = Th * ps, Tw * ps
+
+            # f_gt_up_pad  = F.interpolate(self.dino_head(f_gt),  size=(Hpad, Wpad), mode="bilinear", align_corners=False)
+            # f_rnd_up_pad = F.interpolate(self.dino_head(f_rnd), size=(Hpad, Wpad), mode="bilinear", align_corners=False)
+
+            # # 오른쪽/아래만 패딩했으므로 좌상단 기준으로 원 해상도(H,W)로 자르기
+            # H, W = colors.shape[1], colors.shape[2]
+            #                                       # [B,1,H,W]
+            # f_gt_up  = f_gt_up_pad[:,  :, :H, :W]   # [B,C,H,W]
+            # f_rnd_up = f_rnd_up_pad[:, :, :H, :W]   # [B,C,H,W]
+            
+            # # 3) 코사인 불일치(=의미 차이) 맵 -> 배경(inlier) 영역에서만 정합 유도
+            # cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]
+            
+            # dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
+
+            # # 4) 램프/가중치 (초기 과구속 방지)
+            # lam_dino_max   = float(getattr(cfg, "dino_feat_lambda", 0.1)) 
+            # dino_start     = int(getattr(cfg, "dino_feat_start", 0))
+            # dino_end       = int(getattr(cfg, "dino_feat_end",   max(1, cfg.max_steps // 3)))
+            # if step <= dino_start:
+            #     lam_dino = 0.0
+            # elif step >= dino_end:
+            #     lam_dino = lam_dino_max
+            # else:
+            #     tau = (step - dino_start) / max(dino_end - dino_start, 1)
+            #     lam_dino = lam_dino_max * 0.5 * (1.0 - math.cos(math.pi * tau))  # 코사인 램프 0→lam_dino_max
+
+            # dino_loss = lam_dino * dino_feat_loss
+
+            #revised-0918
             #coscine scheduling for ssim_lambda
             curr_ssim_lambda = self.get_ssim_lambda(step)
 
             # loss definition
-            rgbloss = (binary_mask * error_per_pixel).mean()
-            ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
+            rgbloss = (binary_mask * error_per_pixel).sum() / (binary_mask.sum() + 1e-8)
+            # ssim loss
+            # ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
+            ssimloss = 1.0 - self.masked_ssim()(pixels, colors, binary_mask)
             #total loss
             loss = rgbloss * (1.0 - curr_ssim_lambda) + ssimloss * curr_ssim_lambda
 
-            
+
 
 
             if cfg.depth_loss:
@@ -812,23 +924,21 @@ class Runner:
             loss.backward()
             
 
-
-
-
             # sls-mlp trainer
             if self.mlp_spotless:
                 self.spotless_module.train()
 
                 #revised-0913
-                #ablation study1 w cosine scheduling
-                # T0, T1 = cfg.mlp_teacher_mix_start, cfg.mlp_teacher_mix_end
-                # if step <= T0:    w = cfg.mlp_teacher_gt_start
-                # elif step >= T1:  w = cfg.mlp_teacher_gt_end
-                # else:
-                #     tau = (step - T0) / max(T1 - T0, 1)
-                #     w = cfg.mlp_teacher_gt_end + 0.5*(cfg.mlp_teacher_gt_start - cfg.mlp_teacher_gt_end)*(1 + math.cos(math.pi*tau))
+
+                # ablation study1 w cosine scheduling
+                T0, T1 = cfg.mlp_teacher_mix_start, cfg.mlp_teacher_mix_end
+                if step <= T0:    w = cfg.mlp_teacher_gt_start
+                elif step >= T1:  w = cfg.mlp_teacher_gt_end
+                else:
+                    tau = (step - T0) / max(T1 - T0, 1)
+                    w = cfg.mlp_teacher_gt_end + 0.5*(cfg.mlp_teacher_gt_start - cfg.mlp_teacher_gt_end)*(1 + math.cos(math.pi*tau))
                 
-                w = 0.5  #ablation study2 w is 0.5 fixed
+                # w = 0.5  #ablation study2 w is 0.5 fixed
                 teacher = torch.clamp(w * binary_mask + (1.0 - w) * pred_mask.detach(), 0.0, 1.0)
 
 
@@ -1370,17 +1480,18 @@ class Runner:
             
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+            
 
             metrics["psnr"].append(self.psnr(colors, pixels))
             metrics["ssim"].append(self.ssim(colors, pixels))
             metrics["lpips"].append(self.lpips(colors, pixels))
             
             # test metrics with mask applied
-            masked_pixels = pixels * test_binary_mask
-            masked_colors = colors * test_binary_mask
-            metrics["MASK_psnr"].append(self.psnr(masked_colors, masked_pixels))
-            metrics["MASK_ssim"].append(self.ssim(masked_colors, masked_pixels))     
-            metrics["MASK_lpips"].append(self.lpips(masked_colors, masked_pixels))
+            metrics["MASK_psnr"].append(masked_psnr(colors, pixels, test_binary_mask).mean())
+            metrics["MASK_ssim"].append(masked_ssim(colors, pixels, test_binary_mask).mean())     
+            comp_pred = test_binary_mask * colors + (1 - test_binary_mask) * pixels
+            comp_gt   = pixels
+            metrics["MASK_lpips"].append(self.lpips(comp_pred, comp_gt))
 
 
 
