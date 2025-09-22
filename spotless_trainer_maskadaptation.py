@@ -119,7 +119,7 @@ class Config:
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.005
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float =  0.0008 #0.0002 
+    grow_grad2d: float =  0.0002 
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
@@ -194,6 +194,8 @@ class Config:
     mlp_teacher_gt_start:  float = 1.0   # w(0)
     mlp_teacher_gt_end:    float = 0.5   # w(T)
     mlp_dice_lambda:       float = 0.2
+
+    train_cutgrad: int = 20000  
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -451,12 +453,14 @@ class Runner:
         n_gauss = len(self.splats["means3d"])
         self.running_stats = {
             "grad2d": torch.zeros(n_gauss, device=self.device),  # norm of the gradient
-            "count": torch.zeros(n_gauss, device=self.device, dtype=torch.int),
+            "count": torch.zeros(n_gauss, device=self.device, dtype=torch.float), #revised-0919/int2float
             "hist_err": torch.zeros((cfg.bin_size,)),
             "avg_err": 1.0,
             "lower_err": 0.0,
             "upper_err": 1.0,
             "sqrgrad": torch.zeros(n_gauss, device=self.device),
+            "w_static": torch.zeros(n_gauss, device=self.device, dtype=torch.float), #revised-0921
+            "w_dynamic": torch.zeros(n_gauss, device=self.device, dtype=torch.float),
         }
 
     def rasterize_splats(
@@ -548,47 +552,46 @@ class Runner:
 
     #revised
     def get_ssim_lambda(self, step:int) -> float:
+                cfg = self.cfg
                 ramp_end = int(0.5 * cfg.max_steps) 
                 t = min(step / max(ramp_end, 1), 1.0)
                 wt = 0.5 - 0.5 * math.cos(math.pi * t) 
                 return wt * cfg.ssim_lambda
     #revised-0918
-    def masked_ssim(img1, img2, mask, window_size=11, C1=0.01**2, C2=0.03**2):
+    def masked_ssim(self, img1, img2, mask, window_size=11, C1=0.01**2, C2=0.03**2):
         """
-        img1, img2: [B,1,H,W] or [B,3,H,W] (0~1 normalized)
-        mask:       [B,1,H,W] binary mask (1=valid, 0=ignore)
+        img1,img2: [B,3,H,W] in [0,1]
+        mask     : [B,1,H,W] with 1=valid(background), 0=ignore(dynamic)
         """
-        # 윈도우: Gaussian 대신 uniform 사용 가능
-        window = torch.ones((1,1,window_size,window_size), device=img1.device) / (window_size**2)
-        
-        def filt(x): return F.conv2d(x, window, padding=window_size//2, groups=x.shape[1])
-        
-        # 마스크 normalization
-        M = filt(mask)
-        M = torch.clamp(M, min=1e-6)  # 0 division 방지
+        B, C, H, W = img1.shape
+        # per-channel uniform window
+        win = torch.ones((C,1,window_size,window_size), device=img1.device) / (window_size**2)
 
-        mu1 = filt(img1*mask) / M
-        mu2 = filt(img2*mask) / M
+        def filt(x):  # groups=C conv
+            return F.conv2d(x, win, padding=window_size//2, groups=C)
 
-        sigma1_sq = filt((img1*mask)**2) / M - mu1**2
-        sigma2_sq = filt((img2*mask)**2) / M - mu2**2
-        sigma12   = filt((img1*img2*mask)) / M - mu1*mu2
+        m  = mask.repeat(1, C, 1, 1)  # [B,1,H,W] is expanded to [B,3,H,W]
+        M  = torch.clamp(filt(m), min=1e-6)
 
-        ssim_map = ((2*mu1*mu2 + C1) * (2*sigma12 + C2)) / \
-                ((mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2))
+        mu1 = filt(img1 * m) / M
+        mu2 = filt(img2 * m) / M
+        sigma1_sq = filt((img1*m)**2) / M - mu1**2
+        sigma2_sq = filt((img2*m)**2) / M - mu2**2
+        sigma12   = filt((img1*img2*m)) / M - mu1*mu2
 
-        # SSIM 평균도 마스크 영역으로 한정
-        return (ssim_map*mask).sum() / mask.sum()
+        ssim_map = ((2*mu1*mu2 + C1) * (2*sigma12 + C2)) / ((mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2))
+        ssim = (ssim_map * M).sum(dim=(1,2,3)) / (M.sum(dim=(1,2,3)) + 1e-8)
+        return ssim.mean()   # scalar
 
-    def masked_psnr(pred, gt, mask, max_val=1.0):
+    def masked_psnr(self, pred, gt, mask, max_val=1.0):
         """
         to only calculate activated pixels with psnr, cannot use pre-built psnr func
         because there can be include 0 in denominator
         """
-        m = mask.expand_as(pred)
+        m = mask.expand_as(pred) 
         mse = ((pred - gt)**2 * m).sum(dim=(1,2,3)) / (m.sum(dim=(1,2,3)) + 1e-8)
         psnr = 10.0 * torch.log10((max_val**2) / (mse + 1e-12))
-        return psnr  # [B]
+        return psnr.mean()
 
 
 
@@ -716,23 +719,23 @@ class Runner:
             binary_mask = None
             
             #revised-0917
-            pseudo_gt = None
+            # pseudo_gt = None
 
-            if self.pseudo_gt_dir:
-                pseudo_gt_path = self.pseudo_gt_dict.get(mask_name, None)
-                pseudo_gt_img = imageio.imread(pseudo_gt_path) # take same pseudo gt : 이 부분은 나중에 없어져야 함 sam2로 대체
-                orig_imsize = self.parser.imsize_dict.get(name)
-                if orig_imsize is not None:
-                    h0, w0 = orig_imsize
-                    factor = self.cfg.data_factor
-                    h1, w1 = h0 // factor, w0 // factor
-                pseudo_gt_resized = cv2.resize(pseudo_gt_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
-                pseudo_gt_tensor = torch.from_numpy(pseudo_gt_resized).float() / 255.0
-                pseudo_gt_tensor = pseudo_gt_tensor.unsqueeze(0).unsqueeze(-1)
-                if pseudo_gt_tensor.shape[1] != colors.shape[1] or pseudo_gt_tensor.shape[2] != colors.shape[2]:
-                    pseudo_gt_tensor = F.interpolate(pseudo_gt_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
-                    pseudo_gt_tensor = pseudo_gt_tensor.permute(0, 2, 3, 1)
-                pseudo_gt = pseudo_gt_tensor.to(device) 
+            # if self.pseudo_gt_dir:
+            #     pseudo_gt_path = self.pseudo_gt_dict.get(mask_name, None)
+            #     pseudo_gt_img = imageio.imread(pseudo_gt_path) # take same pseudo gt : 이 부분은 나중에 없어져야 함 sam2로 대체
+            #     orig_imsize = self.parser.imsize_dict.get(name)
+            #     if orig_imsize is not None:
+            #         h0, w0 = orig_imsize
+            #         factor = self.cfg.data_factor
+            #         h1, w1 = h0 // factor, w0 // factor
+            #     pseudo_gt_resized = cv2.resize(pseudo_gt_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
+            #     pseudo_gt_tensor = torch.from_numpy(pseudo_gt_resized).float() / 255.0
+            #     pseudo_gt_tensor = pseudo_gt_tensor.unsqueeze(0).unsqueeze(-1)
+            #     if pseudo_gt_tensor.shape[1] != colors.shape[1] or pseudo_gt_tensor.shape[2] != colors.shape[2]:
+            #         pseudo_gt_tensor = F.interpolate(pseudo_gt_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
+            #         pseudo_gt_tensor = pseudo_gt_tensor.permute(0, 2, 3, 1)
+            #     pseudo_gt = pseudo_gt_tensor.to(device) 
 
 
 
@@ -751,7 +754,7 @@ class Runner:
                 mask_img = imageio.imread(mpath)
                 if mask_img.ndim == 3:
                     print("[WARN] mask image has 3 channels, converting to grayscale")
-                    mask_img = mask_img[..., 0]
+                    # mask_img = mask_img[..., 0]
                 orig_imsize = self.parser.imsize_dict.get(name)
                 if orig_imsize is not None:
                     h0, w0 = orig_imsize
@@ -760,6 +763,10 @@ class Runner:
                 else:
                     h1, w1 = colors.shape[1], colors.shape[2]
                 mask_img_resized = cv2.resize(mask_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
+                # dilation 적용
+                kernel = np.ones((5,5), np.uint8)  # 커널 크기를 조절해서 enlarge 정도를 변경
+                mask_img_resized = cv2.dilate(mask_img_resized, kernel, iterations=1)
+
                 mask_tensor = torch.from_numpy(mask_img_resized).float() / 255.0
                 mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(-1)
                 if mask_tensor.shape[1] != colors.shape[1] or mask_tensor.shape[2] != colors.shape[2]:
@@ -824,6 +831,7 @@ class Runner:
                             max=1.0,
                         )
                     )
+
 
             #revised-0913-3
             # ------------------------------------------------------------------------------------
@@ -891,10 +899,10 @@ class Runner:
             curr_ssim_lambda = self.get_ssim_lambda(step)
 
             # loss definition
-            rgbloss = (binary_mask * error_per_pixel).sum() / (binary_mask.sum() + 1e-8)
+            rgbloss = (binary_mask * error_per_pixel).sum() / (binary_mask.sum()*3 + 1e-8)
             # ssim loss
             # ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
-            ssimloss = 1.0 - self.masked_ssim()(pixels, colors, binary_mask)
+            ssimloss = 1.0 - self.masked_ssim(pixels.permute(0,3,1,2), colors.permute(0,3,1,2), binary_mask.permute(0,3,1,2)) # take all into B C H W
             #total loss
             loss = rgbloss * (1.0 - curr_ssim_lambda) + ssimloss * curr_ssim_lambda
 
@@ -924,6 +932,30 @@ class Runner:
             loss.backward()
             
 
+            #revised-0921
+            if step > cfg.train_cutgrad:
+                # dynamic gaussians gating 
+                cnt = self.running_stats["count"].clamp_min(1e-6)
+                d = (self.running_stats["w_dynamic"] / cnt)                      # [N]
+                gate = (d < 0.30).float()                                    # thres 0.30
+                gate_col = gate[:, None, None]                               # SH 
+                # opacities
+                if self.splats["opacities"].grad is not None:
+                    self.splats["opacities"].grad *= gate
+                # SH 색(기본 경로)
+                if "sh0" in self.splats and self.splats["sh0"].grad is not None:
+                    self.splats["sh0"].grad *= gate_col
+                if "shN" in self.splats and self.splats["shN"].grad is not None:
+                    self.splats["shN"].grad *= gate_col
+                if self.splats["means3d"].grad is not None:
+                    self.splats["means3d"].grad *= gate[:, None]
+                if self.splats["scales"].grad is not None:
+                    self.splats["scales"].grad *= gate[:, None]
+                if self.splats["quats"].grad is not None:
+                    self.splats["quats"].grad *= gate[:, None]
+            
+
+
             # sls-mlp trainer
             if self.mlp_spotless:
                 self.spotless_module.train()
@@ -931,29 +963,29 @@ class Runner:
                 #revised-0913
 
                 # ablation study1 w cosine scheduling
-                T0, T1 = cfg.mlp_teacher_mix_start, cfg.mlp_teacher_mix_end
-                if step <= T0:    w = cfg.mlp_teacher_gt_start
-                elif step >= T1:  w = cfg.mlp_teacher_gt_end
-                else:
-                    tau = (step - T0) / max(T1 - T0, 1)
-                    w = cfg.mlp_teacher_gt_end + 0.5*(cfg.mlp_teacher_gt_start - cfg.mlp_teacher_gt_end)*(1 + math.cos(math.pi*tau))
+                # T0, T1 = cfg.mlp_teacher_mix_start, cfg.mlp_teacher_mix_end
+                # if step <= T0:    w = cfg.mlp_teacher_gt_start
+                # elif step >= T1:  w = cfg.mlp_teacher_gt_end
+                # else:
+                #     tau = (step - T0) / max(T1 - T0, 1)
+                #     w = cfg.mlp_teacher_gt_end + 0.5*(cfg.mlp_teacher_gt_start - cfg.mlp_teacher_gt_end)*(1 + math.cos(math.pi*tau))
                 
-                # w = 0.5  #ablation study2 w is 0.5 fixed
-                teacher = torch.clamp(w * binary_mask + (1.0 - w) * pred_mask.detach(), 0.0, 1.0)
+                # # w = 0.5  #ablation study2 w is 0.5 fixed
+                # teacher = torch.clamp(w * binary_mask + (1.0 - w) * pred_mask.detach(), 0.0, 1.0)
 
 
                 if binary_mask is not None:
                     pred_prob = pred_mask_up.reshape(1, colors.shape[1], colors.shape[2], 1) # pred_mask from mlp--like noise!
-                    # gt_inlier = binary_mask 
+                    gt_inlier = binary_mask 
 
-                    bce = F.binary_cross_entropy(pred_prob, teacher)
+                    # bce = F.binary_cross_entropy(pred_prob, teacher)
                     # bce_dynamic = F.binary_cross_entropy(pred_prob*(1-binary_mask),1-binary_mask)
 
-                    if cfg.mlp_dice_lambda > 0:
-                        eps = 1e-6
-                        inter = (pred_prob * teacher).sum()
-                        dice = 1.0 - (2*inter + eps) / (pred_prob.sum() + teacher.sum() + eps) # Dice loss means 1 - Dice coeff
-                        bce = bce + cfg.mlp_dice_lambda * dice
+                    # if cfg.mlp_dice_lambda > 0:
+                    #     eps = 1e-6
+                    #     inter = (pred_prob * teacher).sum()
+                    #     dice = 1.0 - (2*inter + eps) / (pred_prob.sum() + teacher.sum() + eps) # Dice loss means 1 - Dice coeff
+                    #     bce = bce + cfg.mlp_dice_lambda * dice
 
                         # ablation study3 doublemask
                         # dy_inter = (pred_prob * (1-binary_mask)).sum()
@@ -962,22 +994,29 @@ class Runner:
 
                         # bce = bce + bce_dynamic
 
-                    spot_loss = cfg.mlp_gt_lambda * bce + 0.3 * self.spotless_module.get_regularizer() #mlp_gt_lambda = 1.0 hard coded
+                    # spot_loss = cfg.mlp_gt_lambda * bce + 0.3 * self.spotless_module.get_regularizer() #mlp_gt_lambda = 1.0 hard coded
 
 
-                    # bce = F.binary_cross_entropy(pred_prob, gt_inlier)
-                    # spot_loss = cfg.mlp_gt_lambda * bce  # hard coded to 1.0
+                    bce = F.binary_cross_entropy(pred_prob, gt_inlier)
+                    spot_loss = cfg.mlp_gt_lambda * bce  # hard coded to 1.0
 
-                # reg = 0.3 * self.spotless_module.get_regularizer()
-                # spot_loss = spot_loss + reg
+                reg = 0.3 * self.spotless_module.get_regularizer()
+                spot_loss = spot_loss + reg
                 spot_loss.backward()
 
             # Pass the error histogram for capturing error statistics
-            info["err"] = torch.histogram(
-                torch.mean(torch.abs(colors - pixels), dim=-1).clone().detach().cpu(),
-                bins=cfg.bin_size,
-                range=(0.0, 1.0),
-            )[0]
+            #revised-0921 but not used
+            # info["err"] = torch.histogram(
+            #     torch.mean(torch.abs(colors - pixels), dim=-1).clone().detach().cpu(),
+            #     bins=cfg.bin_size,
+            #     range=(0.0, 1.0),
+            # )[0]
+            err_map = torch.mean(torch.abs(colors - pixels), dim=-1)            # [1,H,W]
+            m2d     = binary_mask.squeeze(-1)                                   # [1,H,W]
+            vals    = err_map[m2d > 0.5].detach().cpu()
+            if vals.numel() == 0:
+                vals = torch.zeros(1)  # 안전장치
+            info["err"] = torch.histogram(vals, bins=cfg.bin_size, range=(0.0, 1.0))[0]
 
             desc = f"loss={loss.item():.9f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1007,7 +1046,7 @@ class Runner:
 
             # update running stats for prunning & growing
             if step < cfg.refine_stop_iter:
-                self.update_running_stats(info)
+                self.update_running_stats(info, binary_mask, step)
 
                 if step > cfg.refine_start_iter and step % cfg.refine_every == 0:
                     grads = self.running_stats["grad2d"] / self.running_stats[
@@ -1041,6 +1080,19 @@ class Runner:
 
                     # prune GSs
                     is_prune = torch.sigmoid(self.splats["opacities"]) < cfg.prune_opa
+
+
+                    #revised-0921
+                    #pruning based on static/dynamic weight ratio
+
+                    if step < cfg.refine_start_iter :
+                        cnt = self.running_stats["count"].clamp_min(1e-6)
+                        s = (self.running_stats["w_static"] / cnt)       # 정적 평균 기여 [0,1]
+                        d = (self.running_stats["w_dynamic"]    / cnt)       # 동적 평균 기여 [0,1]
+
+                        bad_dyn = (s < 0.05) & (d > 0.7) & (cnt > 20)   # param need tuning
+                        is_prune = is_prune | bad_dyn
+                
                     if step > cfg.reset_every:
                         # The official code also implements sreen-size pruning but
                         # it's actually not being used due to a bug:
@@ -1158,7 +1210,8 @@ class Runner:
                 self.viewer.update(step, num_train_rays_per_step)
 
     @torch.no_grad()
-    def update_running_stats(self, info: Dict):
+    #revised-0919
+    def update_running_stats(self, info: Dict, binary_mask: torch.Tensor, step: int):
         """Update running stats."""
         cfg = self.cfg
 
@@ -1196,29 +1249,85 @@ class Runner:
             ][0]
         ]
 
+        #revised-0919
+        # ---- (NEW) mask weight per-fragment / per-gaussian ----
+        # binary_mask: [1,H,W,1] with 1=static, 0=dynamic
+        # Convert to BCHW for grid_sample
+        m_bchw = binary_mask.permute(0, 3, 1, 2)  # [1,1,H,W]
+
+        # means2d positions are in normalized [-1,1] screen space (same space grads use)
+        # We'll sample mask at those positions as weights in [0,1].
+        def sample_mask_at_means2d(means2d_xy: torch.Tensor) -> torch.Tensor:
+            """
+            means2d_xy: [..., 2] in [-1,1]
+            returns: [...] in [0,1]
+            """
+            shp = means2d_xy.shape
+            grid = means2d_xy.reshape(1, -1, 1, 2)           # [1, M, 1, 2]
+            w = F.grid_sample(m_bchw, grid, align_corners=True)  # [1,1,M,1]
+            w = w.view(-1)                                   # [M]
+            return w.reshape(*shp[:-1])                      # [...]
+
+        #revised-0919
         if cfg.packed:
             # grads is [nnz, 2]
             gs_ids = info["gaussian_ids"]  # [nnz] or None
-            self.running_stats["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
-            self.running_stats["count"].index_add_(
-                0, gs_ids, torch.ones_like(gs_ids).int()
-            )
-            if cfg.ubp:
-                self.running_stats["sqrgrad"].index_add_(
-                    0, gs_ids, torch.sum(sqrgrads, dim=-1)
+            # sample mask weight per fragment (same length as grads)
+
+            if step > cfg.train_cutgrad:
+                w = sample_mask_at_means2d(info["means2d"].detach())  # [nnz] in [0,1]
+                w_clamped = w.clamp_(0.0, 1.0)
+                #revised-0921
+                w_dyn = 1.0 - w
+                self.running_stats["w_static"].index_add_(0, gs_ids,w_clamped)
+                self.running_stats["w_dynamic"].index_add_(0, gs_ids,w_dyn)
+                self.running_stats["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1)*w_clamped)
+                self.running_stats["count"].index_add_(0, gs_ids, w_clamped)
+                if cfg.ubp:
+                    self.running_stats["sqrgrad"].index_add_(
+                    0, gs_ids, torch.sum(sqrgrads, dim=-1) * w_clamped
                 )
+            else:
+                self.running_stats["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+                self.running_stats["count"].index_add_(
+                    0, gs_ids, torch.ones_like(gs_ids).float()
+                )
+                if cfg.ubp:
+                    self.running_stats["sqrgrad"].index_add_(
+                        0, gs_ids, torch.sum(sqrgrads, dim=-1)
+                    )
+
+
         else:
             # grads is [C, N, 2]
             sel = info["radii"] > 0.0  # [C, N]
             gs_ids = torch.where(sel)[1]  # [nnz]
-            self.running_stats["grad2d"].index_add_(0, gs_ids, grads[sel].norm(dim=-1))
-            self.running_stats["count"].index_add_(
-                0, gs_ids, torch.ones_like(gs_ids).int()
-            )
-            if cfg.ubp:
-                self.running_stats["sqrgrad"].index_add_(
-                    0, gs_ids, torch.sum(sqrgrads[sel], dim=-1)
-                )
+            # sample weights at means2d [C,N,2] → [C,N]
+
+            if step > cfg.train_cutgrad:
+
+                w_full = sample_mask_at_means2d(info["means2d"].detach())  # [C,N]
+                w_sel  = w_full[sel].clamp_(0.0, 1.0)                      # [nnz]
+                #revised-0921
+                w_dynn = 1.0 - w_sel
+                self.running_stats["w_static"].index_add_(0, gs_ids,w_sel)
+                self.running_stats["w_dynamic"].index_add_(0, gs_ids,w_dynn)
+                self.running_stats["grad2d"].index_add_(0, gs_ids, grads[sel].norm(dim=-1) * w_sel)
+                self.running_stats["count"].index_add_(0, gs_ids, w_sel)
+                if cfg.ubp:
+                    self.running_stats["sqrgrad"].index_add_(
+                        0, gs_ids, torch.sum(sqrgrads[sel], dim=-1) * w_sel
+                    )
+            else:
+                self.running_stats["grad2d"].index_add_(0, gs_ids, grads[sel].norm(dim=-1))
+                self.running_stats["count"].index_add_(
+                    0, gs_ids, torch.ones_like(gs_ids).float()
+                )     
+                if cfg.ubp:
+                    self.running_stats["sqrgrad"].index_add_(
+                        0, gs_ids, torch.sum(sqrgrads[sel], dim=-1)
+                    )
+
 
     @torch.no_grad()
     def reset_opa(self, value: float = 0.01):
@@ -1454,7 +1563,9 @@ class Runner:
                 test_mask_img = imageio.imread(mpath)
                 if test_mask_img.ndim == 3:
                     print("[WARN] mask image has 3 channels, converting to grayscale")
-                    test_mask_img = test_mask_img[..., 0]
+                    # test_mask_img = test_mask_img[..., 0]
+
+
                 orig_imsize = self.parser.imsize_dict.get(name)
                 if orig_imsize is not None:
                     h0, w0 = orig_imsize
@@ -1463,6 +1574,11 @@ class Runner:
                 else:
                     h1, w1 = colors.shape[1], colors.shape[2]
                 test_mask_img_resized = cv2.resize(test_mask_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
+
+                # dilation 적용
+                kernel = np.ones((5,5), np.uint8)  # 커널 크기를 조절해서 enlarge 정도를 변경
+                test_mask_img_resized = cv2.dilate(test_mask_img_resized, kernel, iterations=1)
+
                 test_mask_tensor = torch.from_numpy(test_mask_img_resized).float() / 255.0
                 test_mask_tensor = test_mask_tensor.unsqueeze(0).unsqueeze(-1)
                 
@@ -1470,8 +1586,7 @@ class Runner:
                     test_mask_tensor = F.interpolate(test_mask_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
                     test_mask_tensor = test_mask_tensor.permute(0, 2, 3, 1)
                 test_binary_mask = test_mask_tensor.to(device)
-                test_binary_mask = test_binary_mask.permute(0, 3, 1, 2)
-                test_binary_mask = test_binary_mask.expand(-1, 3, -1, -1)
+                test_binary_mask = test_binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W]
                 test_binary_mask = 1.0 - test_binary_mask  # 1 for background, 0 for foreground
                 # print("test_binary_mask unique:", torch.unique(test_binary_mask))
                 # print("test_binary_mask mean:", test_binary_mask.mean())
@@ -1487,8 +1602,8 @@ class Runner:
             metrics["lpips"].append(self.lpips(colors, pixels))
             
             # test metrics with mask applied
-            metrics["MASK_psnr"].append(masked_psnr(colors, pixels, test_binary_mask).mean())
-            metrics["MASK_ssim"].append(masked_ssim(colors, pixels, test_binary_mask).mean())     
+            metrics["MASK_psnr"].append(self.masked_psnr(colors, pixels, test_binary_mask))
+            metrics["MASK_ssim"].append(self.masked_ssim(colors, pixels, test_binary_mask).mean())     
             comp_pred = test_binary_mask * colors + (1 - test_binary_mask) * pixels
             comp_gt   = pixels
             metrics["MASK_lpips"].append(self.lpips(comp_pred, comp_gt))
