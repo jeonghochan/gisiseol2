@@ -511,23 +511,23 @@ class Runner:
             with torch.no_grad():
                 gate = None  # [N] in {0,1}
 
-                # # per-view gate from image mask (가우시안의 중심이 동적영역에 있는가!)
-                # if mask_bchw is not None:
-                #     # 현재 배치가 보통 C=1이므로 0번째 뷰 사용
-                #     viewmat = torch.linalg.inv(camtoworlds)[0]  # [4,4]
-                #     K = Ks[0]                                   # [3,3]
-                #     xyz1 = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)  # [N,4]
-                #     xc   = (viewmat @ xyz1.t()).t()[:, :3]      # [N,3] (cam space)
-                #     z    = xc[:, 2].clamp_min(1e-6)             # 깊이
-                #     hp   = (K @ xc.t()).t()                     # [N,3]
-                #     u, v = hp[:, 0] / z, hp[:, 1] / z           # pixel coords
-                #     gx   = (u / (width  - 1) * 2) - 1           # [-1,1]
-                #     gy   = (v / (height - 1) * 2) - 1           # [-1,1]
-                #     grid = torch.stack([gx, gy], dim=-1).view(1, 1, -1, 2)  # [1,1,N,2]
-                #     m = F.grid_sample(mask_bchw, grid, mode="nearest", align_corners=True).view(-1)  # [N]
-                #     m = m * (z > 0).float()                     # 카메라 뒤는 0
-                #     gate_view = (m > 0.5).float()               # 1=static, 0=dynamic// current view dynamic/static decision
-                #     gate = gate_view
+                # per-view gate from image mask (가우시안의 중심이 동적영역에 있는가!)
+                if mask_bchw is not None:
+                    # 현재 배치가 보통 C=1이므로 0번째 뷰 사용
+                    viewmat = torch.linalg.inv(camtoworlds)[0]  # [4,4]
+                    K = Ks[0]                                   # [3,3]
+                    xyz1 = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)  # [N,4]
+                    xc   = (viewmat @ xyz1.t()).t()[:, :3]      # [N,3] (cam space)
+                    z    = xc[:, 2].clamp_min(1e-6)             # 깊이
+                    hp   = (K @ xc.t()).t()                     # [N,3]
+                    u, v = hp[:, 0] / z, hp[:, 1] / z           # pixel coords
+                    gx   = (u / (width  - 1) * 2) - 1           # [-1,1]
+                    gy   = (v / (height - 1) * 2) - 1           # [-1,1]
+                    grid = torch.stack([gx, gy], dim=-1).view(1, 1, -1, 2)  # [1,1,N,2]
+                    m = F.grid_sample(mask_bchw, grid, mode="nearest", align_corners=True).view(-1)  # [N]
+                    m = m * (z > 0).float()                     # 카메라 뒤는 0
+                    gate_view = (m > 0.5).float()               # 1=static, 0=dynamic// current view dynamic/static decision
+                    gate = gate_view
 
                 # (b)dynamic/static decision gate
                 dyn = self.running_stats.get("w_dynamic", None)
@@ -1323,12 +1323,12 @@ class Runner:
             #not used for low gaussian density
             # sample mask weight per fragment (same length as grads)
             # if step > cfg.train_cutgrad:
-            w = sample_mask_at_means2d(info["means2d"].detach(),binary_mask)  # [nnz] in [0,1]
-            w_clamped = w.clamp_(0.0, 1.0)
+            # w = sample_mask_at_means2d(info["means2d"].detach())  # [nnz] in [0,1]
+            # w_clamped = w.clamp_(0.0, 1.0)
             # #revised-0921
-            w_dyn = 1.0 - w
-            self.running_stats["w_static"].index_add_(0, gs_ids,w_clamped)
-            self.running_stats["w_dynamic"].index_add_(0, gs_ids,w_dyn)
+            # w_dyn = 1.0 - w
+            # self.running_stats["w_static"].index_add_(0, gs_ids,w_clamped)
+            # self.running_stats["w_dynamic"].index_add_(0, gs_ids,w_dyn)
             # self.running_stats["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1)*w_clamped)
             # self.running_stats["count"].index_add_(0, gs_ids, w_clamped)
             # if cfg.ubp:
@@ -1356,12 +1356,12 @@ class Runner:
             #not used for low gaussian density
             # if step > cfg.train_cutgrad:
 
-            w_full = sample_mask_at_means2d(info["means2d"].detach(),binary_mask)  # [C,N]
-            w_sel  = w_full[sel].clamp_(0.0, 1.0)                      # [nnz]
+            # w_full = sample_mask_at_means2d(info["means2d"].detach())  # [C,N]
+            # w_sel  = w_full[sel].clamp_(0.0, 1.0)                      # [nnz]
             # #revised-0921
-            w_dynn = 1.0 - w_sel
-            self.running_stats["w_static"].index_add_(0, gs_ids,w_sel)
-            self.running_stats["w_dynamic"].index_add_(0, gs_ids,w_dynn)
+            # w_dynn = 1.0 - w_sel
+            # self.running_stats["w_static"].index_add_(0, gs_ids,w_sel)
+            # self.running_stats["w_dynamic"].index_add_(0, gs_ids,w_dynn)
             # self.running_stats["grad2d"].index_add_(0, gs_ids, grads[sel].norm(dim=-1) * w_sel)
             # self.running_stats["count"].index_add_(0, gs_ids, w_sel)
             # if cfg.ubp:
@@ -1573,7 +1573,7 @@ class Runner:
             base = Path(filename).stem
             name = base.replace("_extra", "").replace("_clutter", "") + ".png"
             test_mask_name = base.replace("_extra", "").replace("_clutter", "")
-            
+        
 
             #revised 0910
             # test mask saved
@@ -1595,7 +1595,6 @@ class Runner:
                     print("[WARN] mask image has 3 channels, converting to grayscale")
                     # test_mask_img = test_mask_img[..., 0]
 
-
                 orig_imsize = self.parser.imsize_dict.get(name)
                 if orig_imsize is not None:
                     h0, w0 = orig_imsize
@@ -1613,20 +1612,15 @@ class Runner:
                 test_mask_tensor = test_mask_tensor.unsqueeze(0).unsqueeze(-1)
                 
                 if test_mask_tensor.shape[1] != h1 or test_mask_tensor.shape[2] != w1:
-                    test_mask_tensor = F.interpolate(test_mask_tensor.permute(0, 3, 1, 2), size=(h1, w1), mode='nearest')
+                    test_mask_tensor = F.interpolate(test_mask_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
                     test_mask_tensor = test_mask_tensor.permute(0, 2, 3, 1)
                     
                 test_binary_mask = test_mask_tensor.to(device)
-                test_binary_mask = test_binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W] changed - different from training
+                test_binary_mask = test_binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W]
                 test_binary_mask = 1.0 - test_binary_mask  # 1 for background, 0 for foreground
                 # print("test_binary_mask unique:", torch.unique(test_binary_mask))
                 # print("test_binary_mask mean:", test_binary_mask.mean())
                 # print("test_binary_mask shape:", test_binary_mask.shape)
-
-
-
-
-
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -1652,6 +1646,7 @@ class Runner:
             imageio.imwrite(os.path.join(gt_test_dir,  name), gt_np)
             imageio.imwrite(os.path.join(rend_test_dir, name), rend_np)
             # print("[DEBUG] TEST gt and rendered images are writtn")
+
             
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
