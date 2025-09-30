@@ -75,11 +75,11 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30000
+    max_steps: int = 300
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7000, 30000])
+    eval_steps: List[int] = field(default_factory=lambda: [70, 300])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7000, 30000])
+    save_steps: List[int] = field(default_factory=lambda: [70, 300])
                                   
     # Initialization strategy
     init_type: str = "sfm"
@@ -126,9 +126,9 @@ class Config:
     prune_scale3d: float = 0.1
 
     # Start refining GSs after this iteration
-    refine_start_iter: int = 500
+    refine_start_iter: int = 50
     # Stop refining GSs after this iteration
-    refine_stop_iter: int = 15000
+    refine_stop_iter: int = 150
     # Reset opacities every this steps
     reset_every: int = 300000
     # Refine GSs every this steps
@@ -195,13 +195,6 @@ class Config:
     # mlp_teacher_gt_end:    float = 0.5   # w(T)
     # mlp_dice_lambda:       float = 0.2
 
-    train_cutgrad: int = 20000
-
-    reseed_dyn_thr   : float = 0.70
-    reseed_sta_thr   : float =  0.80
-    reseed_min_count : int =  20
-    reseed_knn       : int = 16
-    reseed_alpha     : float =  0.02
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -536,7 +529,7 @@ class Runner:
                 # both available
                 if dyn is not None and sta is not None:
                     ratio_dyn = dyn.clamp_min(0.0) / (dyn.clamp_min(0.0) + sta.clamp_min(0.0) + 1e-6)
-                    thr = float(getattr(cfg, "dyn_gate_thresh", 0.1))
+                    thr = float(getattr(cfg, "dyn_gate_thresh", 0.30))
                     gate_stat = (ratio_dyn < thr).float() # 가우시안이 splat된 것이 동적 영역에 많이 포함되는가
                     gate = gate_stat if gate is None else (gate * gate_stat)
 
@@ -1823,10 +1816,11 @@ class Runner:
                 width=width,
                 height=height,
                 mask_bchw=binary_mask.permute(0,3,1,2)if binary_mask is not None else None, #revised-0924
+                step = step, #revised-0924
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
+                render_mode="RGB+ED", #hard coded for depth rendering
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
             depths = renders[0, ..., 3:4]  # [H, W, 1]
