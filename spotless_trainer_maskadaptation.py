@@ -75,11 +75,11 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 30000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7000, 30000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [7000, 30000])
                                   
     # Initialization strategy
     init_type: str = "sfm"
@@ -494,7 +494,7 @@ class Runner:
         Ks: Tensor,
         width: int,
         height: int,
-        mask_bchw: Optional[torch.Tensor] = None,  # [1,1,H,W], 1=static, 0=dynamic # revised-0924
+        mask_bchw: Optional[torch.Tensor] = None,  # in train [1,1,H,W], 1=static, 0=dynamic # revised-0924
         step: Optional[int] = None, # revised-0924
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
@@ -536,7 +536,7 @@ class Runner:
                 # both available
                 if dyn is not None and sta is not None:
                     ratio_dyn = dyn.clamp_min(0.0) / (dyn.clamp_min(0.0) + sta.clamp_min(0.0) + 1e-6)
-                    thr = float(getattr(cfg, "dyn_gate_thresh", 0.30))
+                    thr = float(getattr(cfg, "dyn_gate_thresh", 0.1))
                     gate_stat = (ratio_dyn < thr).float() # 가우시안이 splat된 것이 동적 영역에 많이 포함되는가
                     gate = gate_stat if gate is None else (gate * gate_stat)
 
@@ -796,7 +796,10 @@ class Runner:
                     if mask_tensor.shape[1] != height or mask_tensor.shape[2] != width:
                         mask_tensor = F.interpolate(mask_tensor.permute(0, 3, 1, 2), size=(height, width), mode='nearest')
                         mask_tensor = mask_tensor.permute(0, 2, 3, 1) # [1,H,W,1]
-                    binary_mask = 1.0 -  mask_tensor.to(device) # 1 for background, 0 for dynamic object
+                        print(
+                         "this is in the if문!!!!!!!!"
+                        )
+                    binary_mask = 1.0 -  mask_tensor.to(device) # 1 for background, 0 for dynamic object[1,H,W,1]
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -1616,11 +1619,14 @@ class Runner:
                     test_mask_tensor = test_mask_tensor.permute(0, 2, 3, 1)
                     
                 test_binary_mask = test_mask_tensor.to(device)
+
                 test_binary_mask = test_binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W]
+
                 test_binary_mask = 1.0 - test_binary_mask  # 1 for background, 0 for foreground
                 # print("test_binary_mask unique:", torch.unique(test_binary_mask))
                 # print("test_binary_mask mean:", test_binary_mask.mean())
                 # print("test_binary_mask shape:", test_binary_mask.shape)
+
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -1629,7 +1635,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                mask_bchw=test_binary_mask.permute(0,3,1,2) if test_binary_mask is not None else None, #revised-0924
+                mask_bchw=test_binary_mask if test_binary_mask is not None else None, #revised-0924  [B,1,H,W]
                 step = step, #revised-0924
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
@@ -1738,7 +1744,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                mask_bchw= test_binary_mask.permute(0,3,1,2)if test_binary_mask is not None else None, #revised-0924
+                mask_bchw= test_binary_mask if test_binary_mask is not None else None, #revised-0924
                 step = step, #revised-0924
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
