@@ -142,7 +142,7 @@ class Config:
     # Use absolute gradient for pruning. This typically requires larger --grow_grad2d, e.g., 0.0008 or 0.0006
     absgrad: bool = False
     # Use utilization-based pruning (UBP) for compression: xection 4.2.3 https://arxiv.org/pdf/2406.20055
-    ubp: bool = False
+    ubp: bool = True
     # Threshold for UBP
     ubp_thresh: float = 1e-14
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
@@ -188,8 +188,9 @@ class Config:
 
     # Weight for MLP mask loss
     mlp_gt_lambda: float = 0.1
+    # Weight for DINO feature loss
+    dino_lambda: float = 0.3
   
-
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -603,8 +604,6 @@ class Runner:
         psnr = 10.0 * torch.log10((max_val**2) / (mse + 1e-12))
         return psnr.mean()
 
-
-
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -783,56 +782,66 @@ class Runner:
             else:
                 # robust loss
                 error_per_pixel = torch.abs(colors - pixels)
-                pred_mask = self.robust_mask(
-                    error_per_pixel, self.running_stats["avg_err"]
-                )
-                if cfg.semantics:
-                    sf = data["semantics"].to(device)
-                    if cfg.cluster:
-                        # cluster the semantic feature and mask based on cluster voting
-                        sf = nn.Upsample(
-                            size=(colors.shape[1], colors.shape[2]),
-                            mode="nearest",
-                        )(sf).squeeze(0)
-                        pred_mask = self.robust_cluster_mask(pred_mask, semantics=sf)
-                        print("this should not be printed.")
-                    else:
-                        # 4.1.2 part: use spotless mlp to predict the mask
-                        sf = nn.Upsample(
-                            size=(colors.shape[1], colors.shape[2]),
-                            mode="bilinear",
-                        )(sf).squeeze(0)
-                        pos_enc = get_positional_encodings(
-                            colors.shape[1], colors.shape[2], 20
-                        ).permute((2, 0, 1))
-                        sf = torch.cat([sf, pos_enc], dim=0)
-                        sf_flat = sf.reshape(sf.shape[0], -1).permute((1, 0))
-                        self.spotless_module.eval()
-                        pred_mask_up = self.spotless_module(sf_flat)
-                        pred_mask = pred_mask_up.reshape(  # mlp predicted mask
-                            1, colors.shape[1], colors.shape[2], 1
-                        )
+            
+            # revised
+            #--------------------------------------------------------------------------------------------------------------------------------------------
+            # 0) lazy init (한 번만 만들기)
+            if not hasattr(self, "dino_extractor"):
+                self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
+            if not hasattr(self, "dino_head"):
+                # DINO 토큰(저해상도) -> 픽셀 해상도로 올리는 경량 업샘플 헤드
+                self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
 
-                        # calculate lower and upper bound masks for spotless mlp loss
-                        lower_mask = self.robust_mask(
-                            error_per_pixel, self.running_stats["lower_err"]
-                        )
-                        upper_mask = self.robust_mask(
-                            error_per_pixel, self.running_stats["upper_err"]
-                        )
-                        
-                log_pred_mask = pred_mask.clone()
-        
-                if cfg.schedule:
-                    # schedule sampling of the mask based on alpha
-                    alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
-                    pred_mask = torch.bernoulli(
-                        torch.clip(
-                            alpha + (1 - alpha) * pred_mask.clone().detach(),
-                            min=0.0,
-                            max=1.0,
-                        )
-                    )
+            # self hard coded control
+            mask_adaptation = False
+
+            # 1) DINO 토큰 추출 (GT/Render)  **no no_grad()**  ← 그래디언트가 colors까지 흘러가야 함
+            gt_chw     = pixels.permute(0, 3, 1, 2)    # [B,3,H,W], GT
+            render_chw = colors.permute(0, 3, 1, 2)    # [B,3,H,W], 렌더 결과
+
+            if mask_adaptation and (binary_mask is not None):
+                mask_chw = binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W], 마스크
+                render_chw_safe = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw) # 마스크 영역은 렌더링 그래디언트가 안 흐르도록 처리
+
+            ftok  = self.dino_extractor.extract_tokens(gt_chw)      # [B,Th*Tw,C] (백본 파라미터는 require_grad=False로 freeze)
+            fhtok = self.dino_extractor.extract_tokens(render_chw)  # [B,Th*Tw,C]
+
+            with torch.no_grad():  
+                ftok,  Th, Tw, _, _  = self.dino_extractor.extract_tokens(gt_chw)
+                if mask_adaptation and (binary_mask is not None):
+                    fhtok, Th2, Tw2, _, _  = self.dino_extractor.extract_tokens(render_chw_safe)      
+                else:
+                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw) 
+
+            assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
+            B, _, C = ftok.shape
+
+            f_gt  = ftok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()   # [B,C,Th,Tw]
+            f_rnd = fhtok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()  # [B,C,Th,Tw]
+
+
+            # 2) 업샘플 → 이미지 해상도 정렬
+            ps = self.dino_extractor.patch_size
+            Hpad, Wpad = Th * ps, Tw * ps
+
+            f_gt_up_pad  = F.interpolate(self.dino_head(f_gt),  size=(Hpad, Wpad), mode="bilinear", align_corners=False)
+            f_rnd_up_pad = F.interpolate(self.dino_head(f_rnd), size=(Hpad, Wpad), mode="bilinear", align_corners=False)
+
+            # 오른쪽/아래만 패딩했으므로 좌상단 기준으로 원 해상도(H,W)로 자르기
+            H, W = colors.shape[1], colors.shape[2]
+                                                  # [B,1,H,W]
+            f_gt_up  = f_gt_up_pad[:,  :, :H, :W]   # [B,C,H,W]
+            f_rnd_up = f_rnd_up_pad[:, :, :H, :W]   # [B,C,H,W]
+            
+            # 3) 코사인 불일치(=의미 차이) 맵 -> 배경(inlier) 영역에서만 정합 유도
+            cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]       
+            if mask_adaptation and (binary_mask is not None):
+                dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
+            else:
+                dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
+                
+            dino_loss =  dino_feat_loss
+            #--------------------------------------------------------------------------------------------------------------------------------------------
 
             #revised
             #coscine scheduling for ssim_lambda
@@ -842,10 +851,12 @@ class Runner:
                 # loss definition
                 rgbloss = (binary_mask * error_per_pixel).sum() / (binary_mask.sum()*3 + 1e-8)
                 # ssim loss
+                # (Todo) it should be considered to use masked ssim or not
                 # ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
                 ssimloss = 1.0 - self.masked_ssim(pixels.permute(0,3,1,2), colors.permute(0,3,1,2), binary_mask.permute(0,3,1,2)) # take all into B C H W
+                 
                 #total loss
-                loss = rgbloss * (1.0 - curr_ssim_lambda) + ssimloss * curr_ssim_lambda
+                loss = rgbloss * (1.0 - curr_ssim_lambda) + ssimloss * curr_ssim_lambda + dino_loss * cfg.dino_lambda
 
 
             #depth loss (experimental)
@@ -870,37 +881,6 @@ class Runner:
                 loss += depthloss * cfg.depth_lambda
 
             loss.backward()
-            
-
-            # sls-mlp trainer
-            if self.mlp_spotless:
-                self.spotless_module.train()
-
-                if binary_mask is not None:
-                    pred_prob = pred_mask_up.reshape(1, colors.shape[1], colors.shape[2], 1) # pred_mask from mlp--like noise!
-                    gt_inlier = binary_mask 
-                    bce = F.binary_cross_entropy(pred_prob, gt_inlier)
-                    spot_loss = cfg.mlp_gt_lambda * bce  # hard coded to 1.0
-
-                    reg = 0.3 * self.spotless_module.get_regularizer()
-                    spot_loss = spot_loss + reg
-                    spot_loss.backward()
-                else:
-                    spot_loss = self.spotless_loss(
-                    pred_mask_up.flatten(), upper_mask.flatten(), lower_mask.flatten()
-                    )
-                    reg = 0.5 * self.spotless_module.get_regularizer()
-                    spot_loss = spot_loss + reg
-                    spot_loss.backward()
-                    print("sls-mlp is training w/o mask")
-
-
-            # Pass the error histogram for capturing error statistics
-            info["err"] = torch.histogram(
-            torch.mean(torch.abs(colors - pixels), dim=-1).clone().detach().cpu(),
-            bins=cfg.bin_size,
-            range=(0.0, 1.0),
-            )[0]
             
             desc = f"loss={loss.item():.9f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -967,7 +947,7 @@ class Runner:
                     # prune GSs
                     is_prune = torch.sigmoid(self.splats["opacities"]) < cfg.prune_opa                
                     if step > cfg.reset_every:
-                        # The official code also implements sreen-size pruning but
+                        # The official code also implements screen-size pruning but
                         # it's actually not being used due to a bug:
                         # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
                         is_too_big = (
@@ -980,6 +960,7 @@ class Runner:
                         is_prune = is_prune | not_utilized
                     n_prune = is_prune.sum().item()
                     self.refine_keep(~is_prune)
+
                     print(
                         f"Step {step}: {n_prune} GSs pruned. "
                         f"Now having {len(self.splats['means3d'])} GSs."
@@ -1031,9 +1012,8 @@ class Runner:
             # Save the mask image with gt -renders
             if step > max_steps - 200 and cfg.semantics:
                 st_interval = time.time()
-                rgb_pred_mask = (
-                    (log_pred_mask > 0.5).repeat(1, 1, 1, 3).clone().detach() # [1,H,W,3], predicted mask by mlp
-                )
+                rgb_pred_mask = (binary_mask.repeat(1, 1, 1, 3).clone().detach())
+
                 canvas = (
                     torch.cat([pixels, rgb_pred_mask, colors], dim=2)
                     .squeeze(0)
@@ -1099,30 +1079,6 @@ class Runner:
             sqrgrads = info["means2d"].sqrgrad.clone()
         grads[..., 0] *= info["width"] / 2.0 * cfg.batch_size
         grads[..., 1] *= info["height"] / 2.0 * cfg.batch_size
-
-        self.running_stats["hist_err"] = (
-            0.95 * self.running_stats["hist_err"] + info["err"]
-        )
-        mid_err = torch.sum(self.running_stats["hist_err"]) * cfg.robust_percentile
-        self.running_stats["avg_err"] = torch.linspace(0, 1, cfg.bin_size + 1)[
-            torch.where(torch.cumsum(self.running_stats["hist_err"], 0) >= mid_err)[0][
-                0
-            ]
-        ]
-
-        lower_err = torch.sum(self.running_stats["hist_err"]) * cfg.lower_bound
-        upper_err = torch.sum(self.running_stats["hist_err"]) * cfg.upper_bound
-
-        self.running_stats["lower_err"] = torch.linspace(0, 1, cfg.bin_size + 1)[
-            torch.where(torch.cumsum(self.running_stats["hist_err"], 0) >= lower_err)[
-                0
-            ][0]
-        ]
-        self.running_stats["upper_err"] = torch.linspace(0, 1, cfg.bin_size + 1)[
-            torch.where(torch.cumsum(self.running_stats["hist_err"], 0) >= upper_err)[
-                0
-            ][0]
-        ]
 
         if cfg.packed:
             # grads is [nnz, 2]
