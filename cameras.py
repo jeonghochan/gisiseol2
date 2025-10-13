@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+#use for mask adaptation
+
 import torch
 from torch import nn
 import numpy as np
