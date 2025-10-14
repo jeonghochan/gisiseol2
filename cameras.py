@@ -15,7 +15,7 @@ import torch
 from torch import nn
 import numpy as np
 import cv2
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrix_
+from segs_modules.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrix_
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
