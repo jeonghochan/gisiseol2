@@ -35,6 +35,7 @@ from utils import (
 
 from gsplat.rendering import rasterization
 from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead
+from cameras import Camera, PseudoCamera
 
 
 @dataclass
@@ -189,8 +190,7 @@ class Config:
     # Weight for MLP mask loss
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
-    dino_lambda: float = 0.3
-  
+    dino_lambda: float = 0.2  
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -502,6 +502,7 @@ class Runner:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+        
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -519,6 +520,201 @@ class Runner:
             rasterize_mode=rasterize_mode,
             **kwargs,
         )
+
+        # # Debug: print image size and sample sizes of up to 10 splatted Gaussians
+        # try:
+        #     W = int(width)
+        #     H = int(height)
+        #     # determine candidate gaussian ids
+        #     if "gaussian_ids" in info and info["gaussian_ids"] is not None:
+        #         try:
+        #             unique_ids = torch.unique(info["gaussian_ids"].long())
+        #         except Exception:
+        #             unique_ids = torch.arange(len(means), device=means.device)
+        #     else:
+        #         unique_ids = torch.arange(len(means), device=means.device)
+
+        #     num_to_show = min(10, unique_ids.numel())
+        #     sample_ids = unique_ids[:num_to_show].cpu().numpy().tolist()
+
+        #     # try to extract radii (image-space) if available, otherwise fall back to world-space scales
+        #     radii_info = info.get("radii", None)
+        #     sizes = []
+        #     if radii_info is not None and isinstance(radii_info, torch.Tensor):
+        #         r = radii_info
+        #         if r.dim() == 2:
+        #             # [C, N] -> take max across channels
+        #             per_gauss = r.max(dim=0).values
+        #             for idx in sample_ids:
+        #                 sizes.append(float(per_gauss[idx].cpu().item()))
+        #         elif r.dim() == 1 and "gaussian_ids" in info:
+        #             # per-fragment radii: aggregate by gaussian id
+        #             gid = info["gaussian_ids"].long().view(-1)
+        #             per_frag = r.view(-1)
+        #             per_gauss = torch.zeros(len(means), device=means.device)
+        #             per_gauss.index_add_(0, gid, per_frag)
+        #             counts = torch.bincount(gid, minlength=len(means)).float().clamp_min(1.0)
+        #             per_gauss = per_gauss / counts
+        #             for idx in sample_ids:
+        #                 sizes.append(float(per_gauss[idx].cpu().item()))
+        #         else:
+        #             for idx in sample_ids:
+        #                 sizes.append(float(r[idx].cpu().item() if idx < r.numel() else 0.0))
+        #     else:
+        #         # fallback: use world-space scales (max of 3 axes)
+        #         for idx in sample_ids:
+        #             s = scales[idx].max().cpu().item()
+        #             sizes.append(float(s))
+
+        #     print(f"[DEBUG] Image WxH: {W}x{H}. Showing {num_to_show} Gaussian sizes (pixels or fallback world-units) for IDs {sample_ids}: {sizes}")
+        # except Exception as e:
+        #     print(f"[DEBUG] Failed to print gaussian sizes: {e}")
+        # # Debug: print image size and sample sizes of up to 10 splatted Gaussians
+        # try:
+        #     W = int(width)
+        #     H = int(height)
+        #     # determine candidate gaussian ids
+        #     if "gaussian_ids" in info and info["gaussian_ids"] is not None:
+        #         try:
+        #             unique_ids = torch.unique(info["gaussian_ids"].long())
+        #         except Exception:
+        #             unique_ids = torch.arange(len(means), device=means.device)
+        #     else:
+        #         unique_ids = torch.arange(len(means), device=means.device)
+
+        #     num_to_show = min(10, unique_ids.numel())
+        #     sample_ids = unique_ids[:num_to_show].cpu().numpy().tolist()
+
+        #     # try to extract radii (image-space) if available, otherwise fall back to world-space scales
+        #     radii_info = info.get("radii", None)
+        #     sizes = []
+        #     if radii_info is not None and isinstance(radii_info, torch.Tensor):
+        #         r = radii_info
+        #         if r.dim() == 2:
+        #             # [C, N] -> take max across channels
+        #             per_gauss = r.max(dim=0).values
+        #             for idx in sample_ids:
+        #                 sizes.append(float(per_gauss[idx].cpu().item()))
+        #         elif r.dim() == 1 and "gaussian_ids" in info:
+        #             # per-fragment radii: aggregate by gaussian id
+        #             gid = info["gaussian_ids"].long().view(-1)
+        #             per_frag = r.view(-1)
+        #             per_gauss = torch.zeros(len(means), device=means.device)
+        #             per_gauss.index_add_(0, gid, per_frag)
+        #             counts = torch.bincount(gid, minlength=len(means)).float().clamp_min(1.0)
+        #             per_gauss = per_gauss / counts
+        #             for idx in sample_ids:
+        #                 sizes.append(float(per_gauss[idx].cpu().item()))
+        #         else:
+        #             for idx in sample_ids:
+        #                 sizes.append(float(r[idx].cpu().item() if idx < r.numel() else 0.0))
+        #     else:
+        #         # fallback: use world-space scales (max of 3 axes)
+        #         for idx in sample_ids:
+        #             s = scales[idx].max().cpu().item()
+        #             sizes.append(float(s))
+
+        #     print(f"[DEBUG] Image WxH: {W}x{H}. Showing {num_to_show} Gaussian sizes (pixels or fallback world-units) for IDs {sample_ids}: {sizes}")
+        # except Exception as e:
+        #     print(f"[DEBUG] Failed to print gaussian sizes: {e}")
+        # means2d = info.get("means2d", None)
+        # if means2d is not None and isinstance(means2d, torch.Tensor):
+        #     # 만약 means2d가 normalized [-1,1]이라면:
+        #     m = means2d.detach().cpu()  # shape [nnz, 2] 혹은 [N,2]
+        #     # 보장: 2차원 배열로 변환
+        #     try:
+        #         m = m.reshape(-1, 2)
+        #     except Exception:
+        #         # 만약 이미 numpy라면 변환
+        #         m = m
+        #     # 예: normalized -> pixel coords (NumPy로 계산해 scalar int 확보)
+        #     m_np = m.numpy()
+        #     pix_x = ((m_np[:, 0] + 1.0) / 2.0 * (W - 1)).astype(int)
+        #     pix_y = ((1.0 - (m_np[:, 1] + 1.0) / 2.0) * (H - 1)).astype(int)  # y 방향 주의
+        #     # radii per gaussian (per_gauss 계산 필요). 안전하게 정의해 둠
+        #     try:
+        #         _per_gauss = None
+        #         if "per_gauss" in locals():
+        #             _per_gauss = per_gauss.detach().cpu().numpy()
+        #         else:
+        #             # fallback: use world-space scales (max of 3 axes)
+        #             _per_gauss = scales.max(dim=-1).values.detach().cpu().numpy()
+        #     except Exception:
+        #         _per_gauss = None
+
+        #     import cv2
+        #     # Use the rendered image (render_colors) for visualization
+        #     try:
+        #         im = (render_colors[0].detach().cpu().numpy() * 255).astype(np.uint8)  # [H,W,3]
+        #     except Exception:
+        #         # fallback if render_colors is not as expected
+        #         im = np.zeros((H, W, 3), dtype=np.uint8)
+
+        #     # Save the raw rendered image for diagnosis
+        #     try:
+        #         raw_path = os.path.join(getattr(self.cfg, 'result_dir', '.') or '.', 'debug_render.png')
+        #         cv2.imwrite(raw_path, im)
+        #         print(f"[DEBUG] wrote raw render to {os.path.abspath(raw_path)}")
+        #     except Exception as ee:
+        #         print(f"[DEBUG] failed to write raw render: {ee}")
+        #     H_img, W_img = im.shape[0], im.shape[1]
+        #     for i, (x, y) in enumerate(zip(pix_x[:50], pix_y[:50])):  # 상위 50개만
+        #         try:
+        #             r = int(_per_gauss[i]) if (_per_gauss is not None and i < len(_per_gauss)) else 5
+        #         except Exception:
+        #             r = 5
+        #         # 안전하게 int로 변환하고 이미지 경계 내로 클램프
+        #         cx = int(x) if isinstance(x, (int, np.integer)) else int(x.item()) if hasattr(x, 'item') else int(x)
+        #         cy = int(y) if isinstance(y, (int, np.integer)) else int(y.item()) if hasattr(y, 'item') else int(y)
+        #         cx = max(0, min(W_img - 1, cx))
+        #         cy = max(0, min(H_img - 1, cy))
+        #         rr = max(1, int(r))
+        #         # draw a filled circle with thicker border for visibility
+        #         cv2.circle(im, (cx, cy), rr, (0, 255, 0), -1)
+        #         cv2.circle(im, (cx, cy), rr + 1, (0, 0, 0), 1)
+        #     # write to tmp (platform neutral path if possible)
+        #     try:
+        #         # ensure image is H x W x 3
+        #         if im.ndim == 2:
+        #             im_to_save = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
+        #         elif im.shape[2] == 4:
+        #             im_to_save = im[:, :, :3]
+        #         else:
+        #             im_to_save = im
+
+        #         out_dir = getattr(self.cfg, 'result_dir', '.') or '.'
+        #         out_path = os.path.join(out_dir, f"debug_overlay.png")
+        #         ok = cv2.imwrite(out_path, im_to_save)
+        #         print(f"[DEBUG] wrote overlay to {os.path.abspath(out_path)} success={ok}")
+        #     except Exception as ee:
+        #         print(f"[DEBUG] failed to write overlay: {ee}")
+        #     # Print diagnostic info about radii/means2d to help root-cause the all-zero sizes
+        #     try:
+        #         print('[DEBUG] info keys:', list(info.keys()))
+        #         if 'radii' in info and isinstance(info['radii'], torch.Tensor):
+        #             r = info['radii']
+        #             try:
+        #                 print('[DEBUG] radii shape:', r.shape, 'min/max:', float(r.min()), float(r.max()))
+        #             except Exception:
+        #                 print('[DEBUG] radii sample (flatten):', r.view(-1)[:20])
+        #         if 'gaussian_ids' in info and isinstance(info['gaussian_ids'], torch.Tensor):
+        #             gid = info['gaussian_ids'].long().view(-1)
+        #             print('[DEBUG] gaussian_ids shape:', gid.shape, 'unique count sample:', torch.unique(gid)[:20])
+        #         if 'means2d' in info and isinstance(info['means2d'], torch.Tensor):
+        #             m = info['means2d'].detach().cpu()
+        #             try:
+        #                 print('[DEBUG] means2d sample:', m.reshape(-1,2)[:10])
+        #             except Exception:
+        #                 print('[DEBUG] means2d sample (raw):', m[:10])
+        #         # world-space scales
+        #         try:
+        #             print('[DEBUG] world scales sample:', torch.exp(self.splats['scales']).max(dim=-1).values[:10])
+        #         except Exception:
+        #             pass
+        #     except Exception as e:
+        #         print('[DEBUG] failed to print diagnostics:', e)
+
+
         return render_colors, render_alphas, info
     
     def robust_mask(
@@ -793,7 +989,7 @@ class Runner:
                 self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
 
             # self hard coded control
-            mask_adaptation = False
+            mask_adaptation = True
 
             # 1) DINO 토큰 추출 (GT/Render)  **no no_grad()**  ← 그래디언트가 colors까지 흘러가야 함
             gt_chw     = pixels.permute(0, 3, 1, 2)    # [B,3,H,W], GT
