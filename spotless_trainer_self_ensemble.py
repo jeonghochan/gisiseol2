@@ -118,16 +118,16 @@ class Config:
     far_plane: float = 1e10
 
     # GSs with opacity below this value will be pruned
-    prune_opa: float = 0.005
+    prune_opa: float = 0.0025 #0.005
     # GSs with image plane gradient above this value will be split/duplicated
     grow_grad2d: float =  0.0002 
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
-    prune_scale3d: float = 0.1
+    prune_scale3d: float = 0.05 # 0.1
 
     # Start refining GSs after this iteration
-    refine_start_iter: int = 500
+    refine_start_iter: int = 1000
     # Stop refining GSs after this iteration
     refine_stop_iter: int = 15000
     # Reset opacities every this steps
@@ -145,7 +145,7 @@ class Config:
     # Use utilization-based pruning (UBP) for compression: xection 4.2.3 https://arxiv.org/pdf/2406.20055
     ubp: bool = True
     # Threshold for UBP
-    ubp_thresh: float = 1e-14
+    ubp_thresh: float = 3e-15 #1e-14
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
