@@ -118,16 +118,16 @@ class Config:
     far_plane: float = 1e10
 
     # GSs with opacity below this value will be pruned
-    prune_opa: float = 0.0025 #0.005
+    prune_opa: float = 0.005
     # GSs with image plane gradient above this value will be split/duplicated
     grow_grad2d: float =  0.0002 
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
-    prune_scale3d: float = 0.05 # 0.1
+    prune_scale3d: float = 0.1
 
     # Start refining GSs after this iteration
-    refine_start_iter: int = 1000
+    refine_start_iter: int = 500
     # Stop refining GSs after this iteration
     refine_stop_iter: int = 15000
     # Reset opacities every this steps
@@ -143,9 +143,9 @@ class Config:
     # Use absolute gradient for pruning. This typically requires larger --grow_grad2d, e.g., 0.0008 or 0.0006
     absgrad: bool = False
     # Use utilization-based pruning (UBP) for compression: xection 4.2.3 https://arxiv.org/pdf/2406.20055
-    ubp: bool = True
+    ubp: bool = False
     # Threshold for UBP
-    ubp_thresh: float = 3e-15 #1e-14
+    ubp_thresh: float = 1e-14
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
@@ -190,6 +190,7 @@ class Config:
     # Weight for MLP mask loss
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
+    dino_loss_flag: bool = False
     dino_lambda: float = 0.3
 
     #parameter for self-ensemble-revised-1013
@@ -205,14 +206,18 @@ class Config:
     uap_noise_anneal_end: int = 20000       # 이 step까지 선형 점감
 
     # ---------------- Self-Ensemble / Pseudo-view Co-Reg ----------------
+    se_coreg_flag: bool = True              # co-reg loss on/off
     se_coreg_enable: bool = True
-    se_coreg_weight: float = 0.2            # render↔render loss 계수
+    se_coreg_weight: float = 0.5            # render↔render loss 계수
     se_pseudo_K: int = 2                    # pseudo view 개수
     # fallback jitter (cameras.PseudoCamera 미사용시)
     se_jitter_deg: float = 1.0              # yaw/pitch/roll 표준편차(도)
     se_jitter_trans: float = 0.01           # 번역 표준편차(장면스케일 비율)
     #--------------------------------------------------------------
-  
+    #revised-1015
+    #-----------------for opacity based pruning---
+    gaussian_visibility_thresh: float = 0.08# Threshold for Gaussian visibility ratio (for dynamic scenes) 
+    start_pseudo_view_iter: int = 7000 # Start opacity-based pruning after this iteration
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -1041,7 +1046,23 @@ class Runner:
             mx = torch.logit(torch.tensor(self.cfg.init_opa, device=dev)).item()
             self.splats["opacities"].data[idx] = torch.clamp(self.splats["opacities"].data[idx], max=mx)
 #-------------------------------------------------------------------------------------------------------------------------
-
+    #revised-1015
+    @torch.no_grad()
+    def _decay_opacity(self, mask: torch.Tensor, factor: float):
+        """
+        Multiply opacity α by `factor` for gaussians where mask==True.
+        Safe in-place update; keeps optimizer state.
+        """
+        if mask is None or mask.numel() == 0:
+            return
+        if mask.dtype != torch.bool:
+            mask = mask.bool()
+        if mask.any():
+            opa = self.splats["opacities"].data
+            alpha = torch.sigmoid(opa)
+            alpha[mask] = torch.clamp(alpha[mask] * factor, 1e-6, 1 - 1e-6)
+            self.splats["opacities"].data = torch.logit(alpha)
+#-------------------------------------------------------------------------------------------------------------------------
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -1277,8 +1298,11 @@ class Runner:
                 dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
             else:
                 dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
-                
-            dino_loss =  dino_feat_loss
+
+            if cfg.dino_loss_flag :
+                dino_loss =  dino_feat_loss
+            else:
+                dino_loss = 0.0
             #--------------------------------------------------------------------------------------------------------------------------------------------
 
             #revised
@@ -1364,7 +1388,12 @@ class Runner:
                 # (선택) 대칭항 추가를 원하면 아래 주석 해제
                 # se_coreg = 0.5 * (F.l1_loss(sigma_imgs, delta_imgs.detach()) + F.l1_loss(delta_imgs, sigma_imgs.detach()))
 
-            loss = loss + self.cfg.se_coreg_weight * se_coreg
+            if cfg.se_coreg_flag:
+                se_coreg_loss = se_coreg
+            else:
+                se_coreg_loss = 0.0
+                    
+            loss = loss + self.cfg.se_coreg_weight * se_coreg_loss
             # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward()
@@ -1434,7 +1463,86 @@ class Runner:
                         f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
                         f"Now having {len(self.splats['means3d'])} GSs."
                     )
+                    
+#revised-1015---------------------------------------------------------------------------------------------------
+                    # test camera pose들에 대한 pseudo view 생성 및 저장
+                    # Trajectory의 초반과 후반부 카메라 포즈 생성
+                    if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter:
+                        print("Generating trajectory start and end poses for pseudo views...")
 
+                        # parser에서 직접 카메라 포즈 가져오기
+                        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+                        camtoworlds = get_ordered_poses(self.parser.camtoworlds)
+                        camtoworlds = torch.from_numpy(camtoworlds).float().to(device)  # [N, 4, 4]
+
+
+                    
+                        # 전체 카메라 수의 20%를 초반과 후반에서 각각 선택
+                        n_views = len(camtoworlds)
+                        n_select = max(1, int(n_views * 0.2))  # 최소 1개는 선택
+
+                        # 초반부와 후반부 카메라 포즈 선택
+                        start_poses = camtoworlds[:n_select]  # 처음 20%
+                        end_poses = camtoworlds[-n_select:]   # 마지막 20%
+
+                        # 선택된 포즈들 결합
+                        selected_poses = torch.cat([start_poses, end_poses], dim=0)  # [2*n_select, 4, 4]
+                        selected_Ks = K.unsqueeze(0).repeat(len(selected_poses), 1, 1)  # [2*n_select, 3, 3]
+
+            
+                        # 각 선택된 포즈에 대해 K개의 pseudo view 생성
+                        pseudo_camtoworlds, pseudo_Ks = self._make_pseudo_views(
+                            selected_poses, 
+                            selected_Ks, 
+                            self.cfg.se_pseudo_K
+                        )
+
+                        # tag visiblity per gaussians
+                        # Initialize Gaussian tracking
+                        num_gaussians = len(self.splats["means3d"])
+                        gaussian_render_counts = torch.zeros(num_gaussians, device=device)
+
+                        # Render each pseudo view
+                        for i in range(len(pseudo_camtoworlds)):
+                            # Get camera parameters for this pseudo view
+                            curr_c2w = pseudo_camtoworlds[i:i+1]  # [1, 4, 4]
+                            curr_K = pseudo_Ks[i:i+1]  # [1, 3, 3]
+                            
+                            # Render the view
+                            _, _, info = self.rasterize_splats(
+                                camtoworlds=curr_c2w,
+                                Ks=curr_K,
+                                width=width,
+                                height=height,
+                                sh_degree=cfg.sh_degree,
+                                near_plane=cfg.near_plane,
+                                far_plane=cfg.far_plane,
+                                packed=True  # Ensure we get gaussian_ids
+                            )
+                            
+                            # Track which Gaussians were used in this view
+                            if "gaussian_ids" in info:
+                                gaussian_ids = info["gaussian_ids"].long()  # [nnz]
+                                if gaussian_ids is not None and gaussian_ids.numel() > 0:
+                                    gaussian_render_counts.index_add_(
+                                        0, 
+                                        gaussian_ids, 
+                                        torch.ones_like(gaussian_ids, dtype=torch.float)
+                                    )
+                    
+                        # Normalize counts to get percentage of views each Gaussian appears in
+                        total_views = len(pseudo_camtoworlds)
+                        gaussian_visibility_ratio = gaussian_render_counts / total_views  # [num_gaussians]
+                        
+                        #if gaussian_visibility_ratio is less than threshold, decay their opacity
+                        low_visibility_mask = gaussian_visibility_ratio < cfg.gaussian_visibility_thresh
+    
+                        if low_visibility_mask.any():
+                            # Use _decay_opacity function with factor for gentle decay
+                            self._decay_opacity(low_visibility_mask, factor=0.8)
+                        print(f"Adjusted opacity for {low_visibility_mask.sum().item()} low-visibility Gaussians")
+
+#---------------------------------------------------------------------------------------------------------------------
                     # prune GSs
                     is_prune = torch.sigmoid(self.splats["opacities"]) < cfg.prune_opa                
                     if step > cfg.reset_every:
@@ -1446,6 +1554,16 @@ class Runner:
                             > cfg.prune_scale3d * self.scene_scale
                         )
                         is_prune = is_prune | is_too_big
+                        
+                    #revised-1015
+                    if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter:
+                        curr_cam_pos = curr_c2w[0, :3, 3]  # [3]
+                        means3d = self.splats["means3d"]  # [num_gaussians, 3]
+                        dists = torch.norm(means3d - curr_cam_pos[None, :], dim=1)  # [num_gaussians]
+                        is_2close = dists < 0.01 * self.scene_scale  # threshold configurable
+                        is_prune = is_prune | is_2close
+#-----------------------------------------------------------------------------------------------------
+                    
                     if cfg.ubp:
                         not_utilized = self.running_stats["sqrgrad"] < cfg.ubp_thresh
                         is_prune = is_prune | not_utilized
