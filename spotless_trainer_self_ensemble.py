@@ -127,9 +127,9 @@ class Config:
     prune_scale3d: float = 0.1
 
     # Start refining GSs after this iteration
-    refine_start_iter: int = 500
     # Stop refining GSs after this iteration
-    refine_stop_iter: int = 15000
+    refine_start_iter: int = 1000
+    refine_stop_iter: int = 20000
     # Reset opacities every this steps
     reset_every: int = 300000
     # Refine GSs every this steps
@@ -198,11 +198,11 @@ class Config:
     uap_start_iter: int = 1000          # warmup 이후 시작
     uap_every: int = 100                    # 실행 주기
     # mask 모드(동적마스크 겹침 비율) 파라미터
-    uap_dyn_overlap_frac: float = 0.20      # splat 면적 대비 '동적(=0)' 픽셀 비율 임계
-    uap_radius_px: float = 3.0              # splat 반경 마진(px)
+    uap_dyn_overlap_frac: float = 0.15      # splat 면적 대비 '동적(=0)' 픽셀 비율 임계 (0.20 -> 0.15로 더 민감하게)
+    uap_radius_px: float = 5.0              # splat 반경 마진(px) (3.0 -> 5.0으로 증가)
     # 공통: 섭동 크기 스케줄
-    uap_noise_init: float = 0.08            # 초기 섭동 강도
-    uap_noise_final: float = 0.02           # 최종 섭동 강도
+    uap_noise_init: float = 0.12            # 초기 섭동 강도 (0.08 -> 0.12로 증가)
+    uap_noise_final: float = 0.03           # 최종 섭동 강도 (0.02 -> 0.03로 증가)
     uap_noise_anneal_end: int = 20000       # 이 step까지 선형 점감
 
     # ---------------- Self-Ensemble / Pseudo-view Co-Reg ----------------
@@ -216,8 +216,22 @@ class Config:
     #--------------------------------------------------------------
     #revised-1015
     #-----------------for opacity based pruning---
-    gaussian_visibility_thresh: float = 0.08# Threshold for Gaussian visibility ratio (for dynamic scenes) 
-    start_pseudo_view_iter: int = 7000 # Start opacity-based pruning after this iteration
+    gaussian_visibility_thresh: float = 0.15# Threshold for Gaussian visibility ratio (0.08 -> 0.15로 증가해서 더 많이 pruning) 
+    start_pseudo_view_iter: int = 5000 # Start opacity-based pruning earlier (7000 -> 5000)
+    
+    #--------------------------------------------------------------
+    #revised-1016 - Advanced Floater Detection
+    #-----------------for advanced floater detection algorithms---
+    enable_depth_floater_detection: bool = True    # Depth-based floater detection
+    depth_floater_thresh: float = 0.3                # Depth inconsistency threshold
+    
+    #--------------------------------------------------------------
+    #revised-1016 - Ghost/Transparency Artifact Fix
+    #-----------------for handling under-reconstructed dynamic regions---
+    dynamic_prune_start_iter: int = 15000          # When to start aggressive pruning
+    enable_dynamic_inpainting: bool = True          # Fill dynamic regions with nearby background Gaussians
+    #--------------------------------------------------------------
+  
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -1062,6 +1076,226 @@ class Runner:
             alpha = torch.sigmoid(opa)
             alpha[mask] = torch.clamp(alpha[mask] * factor, 1e-6, 1 - 1e-6)
             self.splats["opacities"].data = torch.logit(alpha)
+    #revised-1016
+    @torch.no_grad()
+    def _detect_depth_inconsistent_gaussians(
+        self, camtoworlds: Tensor, Ks: Tensor, width: int, height: int, 
+        dyn_mask: Tensor, depth_threshold: float = 0.5
+    ) -> torch.Tensor:
+        """
+        Depth-based floater detection:
+        렌더링된 깊이와 동적 마스크를 비교하여 배경 앞에 떠있는 floater를 감지
+        
+        Args:
+            camtoworlds: [1, 4, 4]
+            Ks: [1, 3, 3]
+            width, height: image dimensions
+            dyn_mask: [1,H,W] or [1,H,W,1], 1=static, 0=dynamic
+            depth_threshold: 깊이 불일치 임계값 (normalized depth 기준)
+        
+        Returns:
+            [N] boolean mask indicating floaters
+        """
+        device = self.device
+        N = len(self.splats["means3d"])
+        
+        # Render depth map
+        renders, _, info = self.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=self.cfg.sh_degree,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            render_mode="RGB+ED",
+            packed=True
+        )
+        
+        if renders.shape[-1] < 4:
+            return torch.zeros(N, dtype=torch.bool, device=device)
+        
+        depth_map = renders[..., 3:4]  # [1, H, W, 1]
+        
+        # Normalize depth
+        valid_depth = depth_map[depth_map > 0]
+        if valid_depth.numel() == 0:
+            return torch.zeros(N, dtype=torch.bool, device=device)
+        
+        depth_min, depth_max = valid_depth.min(), valid_depth.max()
+        depth_normalized = (depth_map - depth_min) / (depth_max - depth_min + 1e-6)
+        
+        # dyn_mask 차원 맞추기
+        if dyn_mask.dim() == 4:
+            dyn_mask = dyn_mask.squeeze(-1)  # [1,H,W]
+        
+        # 동적 영역(0)에서의 깊이 통계
+        dyn_region = (dyn_mask[0] < 0.5)  # [H,W]
+        stat_region = (dyn_mask[0] >= 0.5)  # [H,W]
+        
+        if not dyn_region.any() or not stat_region.any():
+            return torch.zeros(N, dtype=torch.bool, device=device)
+        
+        # 주변 정적 영역의 평균 깊이 계산 (morphological dilation)
+        kernel_size = 15
+        dyn_dilated = F.max_pool2d(
+            dyn_region.float().unsqueeze(0).unsqueeze(0),
+            kernel_size=kernel_size, stride=1, padding=kernel_size//2
+        ).squeeze()
+        
+        # 동적 영역 주변의 정적 영역
+        border_region = (dyn_dilated > 0.5) & stat_region
+        
+        if border_region.any():
+            border_depth_mean = depth_normalized[0, border_region].mean()
+            
+            # 각 Gaussian의 깊이와 비교
+            means3d = self.splats["means3d"]  # [N, 3]
+            cam_pos = camtoworlds[0, :3, 3]  # [3]
+            
+            # Gaussian의 카메라로부터의 거리
+            gauss_depth = torch.norm(means3d - cam_pos[None, :], dim=1)  # [N]
+            gauss_depth_normalized = (gauss_depth - gauss_depth.min()) / (gauss_depth.max() - gauss_depth.min() + 1e-6)
+            
+            # 동적 마스크 영역에 주로 나타나면서 주변 배경보다 앞에 있는 Gaussian 감지
+            if hasattr(self.running_stats, 'w_dynamic') and hasattr(self.running_stats, 'w_static'):
+                w_dyn = self.running_stats["w_dynamic"]
+                w_stat = self.running_stats["w_static"]
+                total_w = w_dyn + w_stat + 1e-6
+                dynamic_ratio = w_dyn / total_w
+                
+                # 동적 영역에 자주 나타나고(>0.5), 배경보다 앞에 있는 Gaussian
+                is_in_dynamic = dynamic_ratio > 0.5
+                is_in_front = gauss_depth_normalized < (border_depth_mean - depth_threshold)
+                
+                floater_mask = is_in_dynamic & is_in_front
+                return floater_mask
+        print("depth inconsistent gaussians detection works")
+        return torch.zeros(N, dtype=torch.bool, device=device)
+
+    @torch.no_grad()
+    def _detect_unstable_gaussians(
+        self, stability_window: int = 100, position_var_thresh: float = 0.1, scale_var_thresh: float = 0.5
+    ) -> torch.Tensor:
+        """
+        Temporal stability check:
+        최근 N step 동안 위치/스케일이 불안정하게 변화하는 Gaussian을 floater로 판단
+        
+        이를 위해서는 running_stats에 히스토리를 저장해야 하므로,
+        여기서는 간단히 현재 gradient 크기와 scale 변화율로 대체
+        """
+        device = self.device
+        N = len(self.splats["means3d"])
+        
+        # Gradient 기반 불안정성: 지속적으로 높은 gradient를 가진 Gaussian
+        if "grad2d" in self.running_stats and "count" in self.running_stats:
+            avg_grad = self.running_stats["grad2d"] / self.running_stats["count"].clamp_min(1.0)
+            
+            # 상위 X% gradient를 가진 Gaussian
+            if avg_grad.max() > 0:
+                grad_threshold = torch.quantile(avg_grad[self.running_stats["count"] > 0], 0.95)
+                high_grad_mask = avg_grad > grad_threshold
+            else:
+                high_grad_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        else:
+            high_grad_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        
+        # 비정상적으로 큰 스케일
+        scales = torch.exp(self.splats["scales"])  # [N, 3]
+        max_scales = scales.max(dim=-1).values
+        scale_threshold = self.scene_scale * self.cfg.prune_scale3d * 0.5  # prune threshold의 50%
+        large_scale_mask = max_scales > scale_threshold
+        
+        # 둘 다 만족하는 Gaussian은 불안정한 floater일 가능성
+        unstable_mask = high_grad_mask & large_scale_mask
+        
+        return unstable_mask
+
+
+    @torch.no_grad()
+    def _inpaint_dynamic_regions(
+        self, binary_mask: torch.Tensor, camtoworlds: Tensor, inpaint_strength: float = 0.1
+    ) -> int:
+        """
+        동적 영역의 "구멍"을 주변 배경 Gaussian으로 채우기 (inpainting)
+        
+        전략: 동적 영역 경계 근처의 정적 Gaussian을 복제하여 구멍을 메움
+        
+        Args:
+            binary_mask: [1,H,W] or [1,H,W,1], 1=static, 0=dynamic
+            camtoworlds: [1, 4, 4]
+            inpaint_strength: 복제할 Gaussian 비율
+        
+        Returns:
+            복제된 Gaussian 개수
+        """
+        device = self.device
+        
+        # binary_mask 차원 정규화
+        if binary_mask.dim() == 4:
+            binary_mask = binary_mask.squeeze(-1)  # [1,H,W]
+        
+        # 동적 영역과 정적 영역 경계 찾기
+        dyn_region = (binary_mask[0] < 0.5).float()  # [H,W]
+        
+        # 동적 영역 경계 (erosion + dilation 차이)
+        kernel_size = 7
+        dyn_eroded = -F.max_pool2d(
+            -dyn_region.unsqueeze(0).unsqueeze(0),
+            kernel_size=kernel_size, stride=1, padding=kernel_size//2
+        ).squeeze()
+        dyn_dilated = F.max_pool2d(
+            dyn_region.unsqueeze(0).unsqueeze(0),
+            kernel_size=kernel_size, stride=1, padding=kernel_size//2
+        ).squeeze()
+        
+        # 경계 영역 (동적 영역 주변)
+        border_region = (dyn_dilated > 0.5) & (dyn_eroded < 0.5)
+        
+        # 카메라 위치
+        cam_pos = camtoworlds[0, :3, 3]  # [3]
+        means3d = self.splats["means3d"]  # [N, 3]
+        
+        # 각 Gaussian을 카메라 평면에 투영하여 경계 영역 근처인지 확인
+        # (간단한 근사: 3D 거리로 대체)
+        
+        # 경계 영역의 중심 계산 (world space)
+        border_pixels = torch.where(border_region)
+        if len(border_pixels[0]) == 0:
+            return 0
+        
+        # 정적 영역의 Gaussian 중 경계 근처에 있는 것 찾기
+        if hasattr(self.running_stats, 'w_static') and hasattr(self.running_stats, 'w_dynamic'):
+            w_stat = self.running_stats["w_static"]
+            w_dyn = self.running_stats["w_dynamic"]
+            total_w = w_stat + w_dyn + 1e-6
+            static_ratio = w_stat / total_w
+            
+            # 주로 정적 영역에 나타나는 Gaussian (>80%)
+            is_background = static_ratio > 0.8
+            
+            # 이 중 일부를 복제하여 동적 영역으로 확장
+            bg_indices = torch.where(is_background)[0]
+            if bg_indices.numel() == 0:
+                return 0
+            
+            # 무작위로 일부 선택
+            n_to_copy = int(bg_indices.numel() * inpaint_strength)
+            if n_to_copy == 0:
+                return 0
+            
+            perm = torch.randperm(bg_indices.numel(), device=device)
+            to_copy = bg_indices[perm[:n_to_copy]]
+            
+            # 복제 (refine_duplicate 사용)
+            copy_mask = torch.zeros(len(means3d), dtype=torch.bool, device=device)
+            copy_mask[to_copy] = True
+            self.refine_duplicate(copy_mask)
+            
+            return n_to_copy
+        
+        return 0
+
 #-------------------------------------------------------------------------------------------------------------------------
     def train(self):
         cfg = self.cfg
@@ -1536,11 +1770,11 @@ class Runner:
                         
                         #if gaussian_visibility_ratio is less than threshold, decay their opacity
                         low_visibility_mask = gaussian_visibility_ratio < cfg.gaussian_visibility_thresh
-    
                         if low_visibility_mask.any():
-                            # Use _decay_opacity function with factor for gentle decay
+                            # Use _decay_opacity function with stronger decay 
                             self._decay_opacity(low_visibility_mask, factor=0.8)
-                        print(f"Adjusted opacity for {low_visibility_mask.sum().item()} low-visibility Gaussians")
+                            print(f"Adjusted opacity for {low_visibility_mask.sum().item()} low-visibility Gaussians")
+                    
 
 #---------------------------------------------------------------------------------------------------------------------
                     # prune GSs
@@ -1555,14 +1789,40 @@ class Runner:
                         )
                         is_prune = is_prune | is_too_big
                         
-                    #revised-1015
+#revised-1015 ---------------------------------------------------------------------------------------------------
                     if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter:
                         curr_cam_pos = curr_c2w[0, :3, 3]  # [3]
                         means3d = self.splats["means3d"]  # [num_gaussians, 3]
                         dists = torch.norm(means3d - curr_cam_pos[None, :], dim=1)  # [num_gaussians]
-                        is_2close = dists < 0.01 * self.scene_scale  # threshold configurable
+                        is_2close = dists < 0.05 * self.scene_scale  # threshold configurable
                         is_prune = is_prune | is_2close
 #-----------------------------------------------------------------------------------------------------
+#revised-1016
+                    # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
+                    # 1. Depth-based floater detection 
+                    if cfg.enable_depth_floater_detection and step >= cfg.dynamic_prune_start_iter: #pseudo view 시작 이후
+                        if step % cfg.refine_every == 0: 
+                            print("[Floater Detection] Running depth-based detection...")
+                            dyn_mask_2d = binary_mask.squeeze(-1) if binary_mask.dim() == 4 else binary_mask
+                            depth_floaters = self._detect_depth_inconsistent_gaussians(
+                                curr_c2w, curr_K, width, height, dyn_mask_2d, depth_threshold=cfg.depth_floater_thresh #take pseudo view camera to this.
+                            )
+                            if depth_floaters.any():
+                                is_prune = is_prune | depth_floaters
+                                print(f"  -> Marked {depth_floaters.sum().item()} depth-inconsistent floaters")
+                    
+                    
+                    # 2. Inpaint dynamic regions (후기에만, pruning 후)
+                    if (cfg.enable_dynamic_inpainting and step >= cfg.dynamic_prune_start_iter):
+                        if step % cfg.refine_every == 0:
+                            print("[Ghost Fix] Inpainting dynamic regions...")
+                            n_inpainted = self._inpaint_dynamic_regions(
+                                binary_mask, camtoworlds, inpaint_strength=0.05
+                            )
+                            if n_inpainted > 0:
+                                print(f"  -> Inpainted {n_inpainted} background Gaussians into dynamic regions")
+                    # ====================================================
+#-----------------------------------------------------------------------------------------------------------
                     
                     if cfg.ubp:
                         not_utilized = self.running_stats["sqrgrad"] < cfg.ubp_thresh
