@@ -80,7 +80,7 @@ parse_masked_inline () {
   fi
 }
 
-for i in $(seq 1 10); do
+for i in $(seq 1 8); do
   OUTDIR="${BASE_OUT}_run${i}"
   LOG="${OUTDIR}/train_eval.log"
   mkdir -p "${OUTDIR}"
