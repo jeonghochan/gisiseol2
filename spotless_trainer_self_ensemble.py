@@ -35,6 +35,7 @@ from utils import (
 
 from gsplat.rendering import rasterization
 from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead
+from convdpt_module import ConvDPT  # ConvDPT 구현
 # from cameras import Camera, PseudoCamera
 
 
@@ -76,6 +77,7 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
+    min_steps: int = 7000
     max_steps: int = 30000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7000, 30000])
@@ -128,8 +130,8 @@ class Config:
 
     # Start refining GSs after this iteration
     # Stop refining GSs after this iteration
-    refine_start_iter: int = 1000
-    refine_stop_iter: int = 20000
+    refine_start_iter: int = 500
+    refine_stop_iter: int = 15000
     # Reset opacities every this steps
     reset_every: int = 300000
     # Refine GSs every this steps
@@ -191,46 +193,46 @@ class Config:
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
     dino_loss_flag: bool = False
-    dino_lambda: float = 0.3
+    # dino_lambda: float = 0.5
+    
 
     #parameter for self-ensemble-revised-1013
-    uap_enable: bool = True                 # on/off
-    uap_start_iter: int = 1000          # warmup 이후 시작
-    uap_every: int = 100                    # 실행 주기
+    # ---------------- Self-Ensemble / Pseudo-view Co-Reg --------------
     # mask 모드(동적마스크 겹침 비율) 파라미터
     uap_dyn_overlap_frac: float = 0.15      # splat 면적 대비 '동적(=0)' 픽셀 비율 임계 (0.20 -> 0.15로 더 민감하게)
-    uap_radius_px: float = 5.0              # splat 반경 마진(px) (3.0 -> 5.0으로 증가)
     # 공통: 섭동 크기 스케줄
     uap_noise_init: float = 0.12            # 초기 섭동 강도 (0.08 -> 0.12로 증가)
     uap_noise_final: float = 0.03           # 최종 섭동 강도 (0.02 -> 0.03로 증가)
-    uap_noise_anneal_end: int = 20000       # 이 step까지 선형 점감
+    uap_noise_anneal_end: int = 15000      # 이 step까지 선형 점감
 
-    # ---------------- Self-Ensemble / Pseudo-view Co-Reg ----------------
-    se_coreg_flag: bool = True              # co-reg loss on/off
-    se_coreg_enable: bool = True
-    se_coreg_weight: float = 0.5            # render↔render loss 계수
+    se_coreg_enable: bool = False
+    se_coreg_lambda: float = 0.5            # render↔render loss 계수
     se_pseudo_K: int = 2                    # pseudo view 개수
     # fallback jitter (cameras.PseudoCamera 미사용시)
     se_jitter_deg: float = 1.0              # yaw/pitch/roll 표준편차(도)
     se_jitter_trans: float = 0.01           # 번역 표준편차(장면스케일 비율)
     #--------------------------------------------------------------
+    
     #revised-1015
     #-----------------for opacity based pruning---
-    gaussian_visibility_thresh: float = 0.15# Threshold for Gaussian visibility ratio (0.08 -> 0.15로 증가해서 더 많이 pruning) 
-    start_pseudo_view_iter: int = 5000 # Start opacity-based pruning earlier (7000 -> 5000)
-    
-    #--------------------------------------------------------------
+    gaussian_visibility_thresh: float = 0.05# Threshold for Gaussian visibility ratio (0.08 -> 0.15로 증가해서 더 많이 pruning) 
+    start_pseudo_view_iter: int = 7000 # Start opacity-based pruning earlier (7000 -> 5000)
+
     #revised-1016 - Advanced Floater Detection
     #-----------------for advanced floater detection algorithms---
     enable_depth_floater_detection: bool = True    # Depth-based floater detection
-    depth_floater_thresh: float = 0.3                # Depth inconsistency threshold
-    
-    #--------------------------------------------------------------
-    #revised-1016 - Ghost/Transparency Artifact Fix
+    depth_floater_thresh: float = 0.005                # Depth inconsistency threshold
+    # Ghost/Transparency Artifact Fix
     #-----------------for handling under-reconstructed dynamic regions---
     dynamic_prune_start_iter: int = 15000          # When to start aggressive pruning
     enable_dynamic_inpainting: bool = True          # Fill dynamic regions with nearby background Gaussians
     #--------------------------------------------------------------
+    #revised-1017
+    # Transient parameters
+    transient_training_enable: bool = True    # on/off
+    KL_threshold: float = 0.5           # KL divergence threshold for masking
+    schedule_beta: float = -3e-3        # Alpha sampling schedule rate
+
   
 
     def adjust_steps(self, factor: float):
@@ -492,7 +494,25 @@ class Runner:
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True).to(
             self.device
         )
+#revised-1017
+        # T-3DGS transient model initialization
+        
+        # Initialize DINO extractor and head before transient model
+        self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
+        self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
 
+        self.transient_model = None
+        self.transient_optimizer = None
+        self.transient_scheduler = None
+
+        # transient model initialization
+        self.transient_model = ConvDPT(self.dino_extractor.dino_model.embed_dim).to(self.device)
+        self.transient_model.train()
+        self.transient_optimizer = torch.optim.Adam(self.transient_model.parameters(), lr=5e-3)
+        self.transient_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.transient_optimizer, cfg.max_steps, 2e-4
+        )
+#------------------------------------------------------------------------------------------------------------
         # Viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
@@ -804,10 +824,22 @@ class Runner:
     #revised
     def get_ssim_lambda(self, step:int) -> float:
                 cfg = self.cfg
-                ramp_end = int(0.5 * cfg.max_steps) 
-                t = min(step / max(ramp_end, 1), 1.0)
-                wt = 0.5 - 0.5 * math.cos(math.pi * t) 
-                return wt * cfg.ssim_lambda
+                # ramp_end = int(0.5 * cfg.max_steps) 
+                # t = min(step / max(ramp_end, 1), 1.0)
+                # wt = 0.5 - 0.5 * math.cos(math.pi * t) 
+                # # return wt * cfg.ssim_lambda
+                # return wt
+
+                cfg = self.cfg
+                ramp_start = cfg.min_steps
+                ramp_end = int(0.5 * cfg.max_steps)
+                if step < ramp_start:
+                    return 0.0
+                t = min((step - ramp_start) / max(ramp_end - ramp_start, 1), 1.0)
+                wt = 0.5 - 0.5 * math.cos(math.pi * t)
+                return wt
+
+    
     
     #revised
     def masked_ssim(self, img1, img2, mask, window_size=11, C1=0.01**2, C2=0.03**2):
@@ -853,7 +885,7 @@ class Runner:
         """
         T = max(self.cfg.uap_noise_anneal_end, 1)
         t = min(step / T, 1.0)
-        print("uap noise ration fucn works")
+        # print("uap noise ration fucn works")
         return self.cfg.uap_noise_init + (self.cfg.uap_noise_final - self.cfg.uap_noise_init) * t
     
 
@@ -880,7 +912,7 @@ class Runner:
             c2w0[i, :3, :3] = R @ c2w0[i, :3, :3]
             c2w0[i, :3, 3] = c2w0[i, :3, 3] + trans[i]
       
-        print("make pseudo view with manual jittering works")
+        # print("make pseudo view with manual jittering works")
         return c2w0, Ks.repeat(K, 1, 1)
 
     @torch.no_grad()
@@ -1060,7 +1092,7 @@ class Runner:
             mx = torch.logit(torch.tensor(self.cfg.init_opa, device=dev)).item()
             self.splats["opacities"].data[idx] = torch.clamp(self.splats["opacities"].data[idx], max=mx)
 #-------------------------------------------------------------------------------------------------------------------------
-    #revised-1015
+#revised-1015
     @torch.no_grad()
     def _decay_opacity(self, mask: torch.Tensor, factor: float):
         """
@@ -1076,7 +1108,7 @@ class Runner:
             alpha = torch.sigmoid(opa)
             alpha[mask] = torch.clamp(alpha[mask] * factor, 1e-6, 1 - 1e-6)
             self.splats["opacities"].data = torch.logit(alpha)
-    #revised-1016
+#revised-1016-------------------------------------------------------------------------------------------
     @torch.no_grad()
     def _detect_depth_inconsistent_gaussians(
         self, camtoworlds: Tensor, Ks: Tensor, width: int, height: int, 
@@ -1174,47 +1206,8 @@ class Runner:
         return torch.zeros(N, dtype=torch.bool, device=device)
 
     @torch.no_grad()
-    def _detect_unstable_gaussians(
-        self, stability_window: int = 100, position_var_thresh: float = 0.1, scale_var_thresh: float = 0.5
-    ) -> torch.Tensor:
-        """
-        Temporal stability check:
-        최근 N step 동안 위치/스케일이 불안정하게 변화하는 Gaussian을 floater로 판단
-        
-        이를 위해서는 running_stats에 히스토리를 저장해야 하므로,
-        여기서는 간단히 현재 gradient 크기와 scale 변화율로 대체
-        """
-        device = self.device
-        N = len(self.splats["means3d"])
-        
-        # Gradient 기반 불안정성: 지속적으로 높은 gradient를 가진 Gaussian
-        if "grad2d" in self.running_stats and "count" in self.running_stats:
-            avg_grad = self.running_stats["grad2d"] / self.running_stats["count"].clamp_min(1.0)
-            
-            # 상위 X% gradient를 가진 Gaussian
-            if avg_grad.max() > 0:
-                grad_threshold = torch.quantile(avg_grad[self.running_stats["count"] > 0], 0.95)
-                high_grad_mask = avg_grad > grad_threshold
-            else:
-                high_grad_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        else:
-            high_grad_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        
-        # 비정상적으로 큰 스케일
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        max_scales = scales.max(dim=-1).values
-        scale_threshold = self.scene_scale * self.cfg.prune_scale3d * 0.5  # prune threshold의 50%
-        large_scale_mask = max_scales > scale_threshold
-        
-        # 둘 다 만족하는 Gaussian은 불안정한 floater일 가능성
-        unstable_mask = high_grad_mask & large_scale_mask
-        
-        return unstable_mask
-
-
-    @torch.no_grad()
     def _inpaint_dynamic_regions(
-        self, binary_mask: torch.Tensor, camtoworlds: Tensor, inpaint_strength: float = 0.1
+        self, binary_mask: torch.Tensor, camtoworlds: Tensor, inpaint_strength: float
     ) -> int:
         """
         동적 영역의 "구멍"을 주변 배경 Gaussian으로 채우기 (inpainting)
@@ -1272,7 +1265,7 @@ class Runner:
             static_ratio = w_stat / total_w
             
             # 주로 정적 영역에 나타나는 Gaussian (>80%)
-            is_background = static_ratio > 0.8
+            is_background = static_ratio > 0.9
             
             # 이 중 일부를 복제하여 동적 영역으로 확장
             bg_indices = torch.where(is_background)[0]
@@ -1295,8 +1288,8 @@ class Runner:
             return n_to_copy
         
         return 0
-
 #-------------------------------------------------------------------------------------------------------------------------
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -1484,6 +1477,7 @@ class Runner:
             if not hasattr(self, "dino_head"):
                 # DINO 토큰(저해상도) -> 픽셀 해상도로 올리는 경량 업샘플 헤드
                 self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
+        
 
             # self hard coded control
             mask_adaptation = False
@@ -1496,15 +1490,14 @@ class Runner:
                 mask_chw = binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W], 마스크
                 render_chw_safe = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw) # 마스크 영역은 렌더링 그래디언트가 안 흐르도록 처리
 
-            ftok  = self.dino_extractor.extract_tokens(gt_chw)      # [B,Th*Tw,C] (백본 파라미터는 require_grad=False로 freeze)
-            fhtok = self.dino_extractor.extract_tokens(render_chw)  # [B,Th*Tw,C]
-
-            with torch.no_grad():  
-                ftok,  Th, Tw, _, _  = self.dino_extractor.extract_tokens(gt_chw)
-                if mask_adaptation and (binary_mask is not None):
-                    fhtok, Th2, Tw2, _, _  = self.dino_extractor.extract_tokens(render_chw_safe)      
-                else:
-                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw) 
+            # Extract tokens for GT and render. Avoid overwriting tokens under
+            # a torch.no_grad() context so that gradients can flow into the
+            # upsample head / render path if desired.
+            ftok, Th, Tw, _, _ = self.dino_extractor.extract_tokens(gt_chw)
+            if mask_adaptation and (binary_mask is not None):
+                fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw_safe)
+            else:
+                fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
 
             assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
             B, _, C = ftok.shape
@@ -1528,6 +1521,8 @@ class Runner:
             
             # 3) 코사인 불일치(=의미 차이) 맵 -> 배경(inlier) 영역에서만 정합 유도
             cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]       
+            # Compute DINO feature loss. If no mask is provided, fall back to
+            # the mean of the cosine-difference map to avoid dividing by None.
             if mask_adaptation and (binary_mask is not None):
                 dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
             else:
@@ -1538,9 +1533,80 @@ class Runner:
             else:
                 dino_loss = 0.0
             #--------------------------------------------------------------------------------------------------------------------------------------------
+#revised-1017
+            # T-3DGS Transient Loss with Covariance Parameters
+
+            transient_loss = 0.0
+
+            if cfg.transient_training_enable and binary_mask is not None:  # transient 활성화 조건
+                # 1) 입력 텐서 준비 (DETACH): ConvDPT만 학습되도록 렌더 경로 차단
+                gt_chw_det     = gt_chw.detach()       # [B,3,H,W]
+                render_chw_det = render_chw.detach()   # [B,3,H,W]
+                transient_input = torch.cat((gt_chw_det, render_chw_det), dim=0)  # [2*B,3,H,W]
+
+                 # 2) 공분산 파라미터 예측
+                # DINO extractor는 가중치 갱신/그래프 연결 불필요 → no_grad
+                with torch.no_grad():
+                    _ = self.dino_extractor  # 일부 구현에서 내부 상태 접근을 위해 참조 필요
+                transient_maps = self.transient_model(transient_input, self.dino_extractor)
+ 
+                 # GT용 파라미터 (σ1, σ2, ρ)
+                sigma_1 = transient_maps[0][0]  # [B, H, W]
+                sigma_2 = transient_maps[0][1]  # [B, H, W]  
+                rho     = transient_maps[0][2]  # [B, H, W]
+
+                s_1 = transient_maps[1][0]  # [B, H, W]
+                s_2 = transient_maps[1][1]  # [B, H, W]
+                r   = transient_maps[1][2]  # [B, H, W]
+                
+                # 수치 안전화 (양쪽 determinant/분산 모두 clamp)
+                eps = 1e-6
+                det        = torch.clamp(sigma_1.square() * sigma_2.square() * (1.0 - rho.square()), min=eps)
+                det_render = torch.clamp(s_1.square()     * s_2.square()     * (1.0 - r.square()  ), min=eps)
+ 
+                 # 4) KL divergence 계산
+
+                # 3) DSSIM 공간 맵 계산 (논문과 동일)
+                ssim_map = self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
+                dssim_map = (1.0 - ssim_map) / 2.0  # [B, H, W]
+
+                # 4) KL divergence 계산
+                KL = ((sigma_1.square() / torch.clamp(s_1.square(), min=eps)
+                    + sigma_2.square() / torch.clamp(s_2.square(), min=eps)
+                    - rho * r * sigma_1 * sigma_2 / torch.clamp(s_1 * s_2, min=eps)) / torch.clamp(1.0 - rho.square(), min=eps)
+                    - torch.log(det / det_render) - 2) * 0.5
+
+                # 5) likelihood (negative log-likelihood)
+                # d_cos와 dssim_map은 detach하여 transient 모델만 학습
+                likelihood = (1 / torch.clamp(1.0 - rho.square(), min=eps)) * (
+                    cosd.squeeze(1).detach().square() / torch.clamp(sigma_1.square(), min=eps) +
+                    dssim_map.detach().square() / torch.clamp(sigma_2.square(), min=eps) -
+                    2 * cosd.squeeze(1).detach() * dssim_map.detach() * rho / torch.clamp(sigma_1 * sigma_2, min=eps)
+                ) + torch.log(det)
+
+                # 6) per-pixel 에너지 맵
+                transient_energy = KL + likelihood  # [B, H, W]
+                transient_energy = torch.nan_to_num(transient_energy, nan=0.0, posinf=10.0, neginf=0.0)
+
+                # 7) (옵션) KL 기반 마스크 생성 및 photometric 손실에 적용 (논문 방식)
+                # KL_threshold, dilate_exp, schedule_beta 등 하이퍼파라미터 필요
+                # 예시:
+                # transient_mask = transient_energy.clone().detach()
+                # transient_mask = dilate_mask(transient_mask, opt_dilate_exp)
+                # mask = torch.where(transient_mask < opt_KL_threshold, 1, 0)
+                # alpha = np.exp(opt_schedule_beta * np.floor((1 + step) / 1.5))
+                # mask = torch.bernoulli(torch.clip(alpha + (1 - alpha) * mask, min=0.0, max=1.0))
+                # mask = mask.detach()
+                # photometric_loss = torch.mean(diff * mask)
+
+                # 8) 전체 평균으로 스칼라화
+                transient_loss = transient_energy.mean()
+
+
+#--------------------------------------------------------------------------------------------------------------------------------------------
 
             #revised
-            #coscine scheduling for ssim_lambda
+            # cosine scheduling for ssim_lambda and compose the photometric loss
             if binary_mask is not None:
                 curr_ssim_lambda = self.get_ssim_lambda(step)
 
@@ -1550,11 +1616,7 @@ class Runner:
                 # (Todo) it should be considered to use masked ssim or not
                 # ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
                 ssimloss = 1.0 - self.masked_ssim(pixels.permute(0,3,1,2), colors.permute(0,3,1,2), binary_mask.permute(0,3,1,2)) # take all into B C H W
-                 
-                #total loss
-                loss = rgbloss * (1.0 - curr_ssim_lambda) + ssimloss * curr_ssim_lambda + dino_loss * cfg.dino_lambda
-
-
+                
             #depth loss (experimental)
             if cfg.depth_loss:
                 # query depths from depth map
@@ -1576,14 +1638,10 @@ class Runner:
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
 
-            #revised-1013
+#revised-1013
             # ---------------- Self-Ensemble: pseudo-view render↔render loss ----------------
             se_coreg = torch.tensor(0.0, device=device)
-            if (self.cfg.se_coreg_enable
-                and step >= self.cfg.uap_start_iter   # warmup 공유
-                and step % self.cfg.uap_every == 0
-                and binary_mask is not None):
-
+            if self.cfg.se_coreg_enable and binary_mask is not None:
 
                 # (1) pseudo views 만들기
                 pv_c2w, pv_K = self._make_pseudo_views(camtoworlds, Ks, self.cfg.se_pseudo_K)
@@ -1617,20 +1675,34 @@ class Runner:
                     )
                     delta_imgs = torch.clamp(delta_imgs, 0.0, 1.0)
                 # (4) render↔render photometric (Σ vs Δ) — Δ는 detach
-                se_coreg = F.l1_loss(sigma_imgs, delta_imgs)
-                print("pseudo view based loss is working")
+                # se_coreg = F.l1_loss(sigma_imgs, delta_imgs)
+                # print("pseudo view based loss is working")
                 # (선택) 대칭항 추가를 원하면 아래 주석 해제
-                # se_coreg = 0.5 * (F.l1_loss(sigma_imgs, delta_imgs.detach()) + F.l1_loss(delta_imgs, sigma_imgs.detach()))
+                se_coreg = 0.5 * (F.l1_loss(sigma_imgs, delta_imgs.detach()) + F.l1_loss(delta_imgs, sigma_imgs.detach()))
 
-            if cfg.se_coreg_flag:
+            if cfg.se_coreg_enable:
                 se_coreg_loss = se_coreg
             else:
                 se_coreg_loss = 0.0
-                    
-            loss = loss + self.cfg.se_coreg_weight * se_coreg_loss
-            # ----------------------------------------------------------------------------------------------------------------------------
 
-            loss.backward()
+            #need scheduler
+            lambda_p = self.get_ssim_lambda(step)
+            #total loss
+            # loss = rgbloss * (1.0 - curr_ssim_lambda) + (ssimloss * curr_ssim_lambda) + (dino_loss * cfg.dino_lambda) + (transient_loss * cfg.transient_lambda) + (self.cfg.se_coreg_lambda * se_coreg_loss)
+            loss = rgbloss * (1.0 - lambda_p) + (lambda_p * se_coreg_loss) + (dino_loss *(lambda_p)) + (transient_loss * lambda_p) 
+# ----------------------------------------------------------------------------------------------------------------------------
+
+            loss.backward(retain_graph = True)
+
+#revised-1017
+            if cfg.transient_training_enable and self.transient_optimizer is not None and (binary_mask is not None):
+                self.transient_optimizer.zero_grad()
+                # 여기서 사용하는 transient_loss는 위에서 DETACH 입력으로 계산된 것
+                transient_loss.backward()     # ConvDPT 파라미터에만 gradient
+                self.transient_optimizer.step()
+                if self.transient_scheduler is not None:
+                    self.transient_scheduler.step()
+# ----------------------------------------------------------------------------------------------------------------------------
 
             desc = f"loss={loss.item():.9f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1651,6 +1723,8 @@ class Runner:
                 #------------------------------------------------------------------------------------------------------------------------
                 self.writer.add_scalar("train/rgbloss", rgbloss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                if transient_loss > 0:
+                    self.writer.add_scalar("train/transient_loss", transient_loss.item(), step)
                 self.writer.add_scalar(
                     "train/num_GS", len(self.splats["means3d"]), step
                 )
@@ -1794,7 +1868,7 @@ class Runner:
                         curr_cam_pos = curr_c2w[0, :3, 3]  # [3]
                         means3d = self.splats["means3d"]  # [num_gaussians, 3]
                         dists = torch.norm(means3d - curr_cam_pos[None, :], dim=1)  # [num_gaussians]
-                        is_2close = dists < 0.05 * self.scene_scale  # threshold configurable
+                        is_2close = dists < 0.02 * self.scene_scale  # threshold configurable
                         is_prune = is_prune | is_2close
 #-----------------------------------------------------------------------------------------------------
 #revised-1016
@@ -1817,7 +1891,7 @@ class Runner:
                         if step % cfg.refine_every == 0:
                             print("[Ghost Fix] Inpainting dynamic regions...")
                             n_inpainted = self._inpaint_dynamic_regions(
-                                binary_mask, camtoworlds, inpaint_strength=0.05
+                                binary_mask, camtoworlds, inpaint_strength=0.7
                             )
                             if n_inpainted > 0:
                                 print(f"  -> Inpainted {n_inpainted} background Gaussians into dynamic regions")
@@ -1877,6 +1951,7 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
+
 
             # Save the mask image with gt -renders
             if step > max_steps - 200 and cfg.semantics:
