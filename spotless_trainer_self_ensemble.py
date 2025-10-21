@@ -193,7 +193,7 @@ class Config:
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
     dino_loss_flag: bool = False
-    # dino_lambda: float = 0.5
+    dino_loss_lambda: float = 0.4
     
 
     #parameter for self-ensemble-revised-1013
@@ -1689,7 +1689,8 @@ class Runner:
             lambda_p = self.get_ssim_lambda(step)
             #total loss
             # loss = rgbloss * (1.0 - curr_ssim_lambda) + (ssimloss * curr_ssim_lambda) + (dino_loss * cfg.dino_lambda) + (transient_loss * cfg.transient_lambda) + (self.cfg.se_coreg_lambda * se_coreg_loss)
-            loss = rgbloss * (1.0 - lambda_p) + (lambda_p * se_coreg_loss) + (dino_loss *(lambda_p)) + (transient_loss * lambda_p) 
+            # loss = rgbloss * (1.0 - lambda_p) + (lambda_p * se_coreg_loss) + (dino_loss *(lambda_p)) + (transient_loss * lambda_p)
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + (transient_loss * lambda_p)  
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward(retain_graph = True)
