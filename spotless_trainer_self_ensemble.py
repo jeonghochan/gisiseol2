@@ -131,7 +131,7 @@ class Config:
     # Start refining GSs after this iteration
     # Stop refining GSs after this iteration
     refine_start_iter: int = 500
-    refine_stop_iter: int = 15000
+    refine_stop_iter: int = 30000 # tag
     # Reset opacities every this steps
     reset_every: int = 300000
     # Refine GSs every this steps
@@ -193,7 +193,7 @@ class Config:
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
     dino_loss_flag: bool = False
-    dino_loss_lambda: float = 0.4
+    dino_loss_lambda: float = 0.7
     
 
     #parameter for self-ensemble-revised-1013
@@ -230,6 +230,7 @@ class Config:
     #revised-1017
     # Transient parameters
     transient_training_enable: bool = True    # on/off
+    transient_loss_start_iter: int = 7000     # iteration부터 main loss에 transient loss 적용
     KL_threshold: float = 0.5           # KL divergence threshold for masking
     schedule_beta: float = -3e-3        # Alpha sampling schedule rate
 
@@ -1535,6 +1536,7 @@ class Runner:
             #--------------------------------------------------------------------------------------------------------------------------------------------
 #revised-1017
             # T-3DGS Transient Loss with Covariance Parameters
+            # transient_model은 항상 학습, 하지만 main loss에 반영은 transient_loss_start_iter 이후부터
 
             transient_loss = 0.0
 
@@ -1675,10 +1677,10 @@ class Runner:
                     )
                     delta_imgs = torch.clamp(delta_imgs, 0.0, 1.0)
                 # (4) render↔render photometric (Σ vs Δ) — Δ는 detach
-                # se_coreg = F.l1_loss(sigma_imgs, delta_imgs)
+                se_coreg = F.l1_loss(sigma_imgs, delta_imgs)
                 # print("pseudo view based loss is working")
                 # (선택) 대칭항 추가를 원하면 아래 주석 해제
-                se_coreg = 0.5 * (F.l1_loss(sigma_imgs, delta_imgs.detach()) + F.l1_loss(delta_imgs, sigma_imgs.detach()))
+                # se_coreg = 0.5 * (F.l1_loss(sigma_imgs, delta_imgs.detach()) + F.l1_loss(delta_imgs, sigma_imgs.detach()))
 
             if cfg.se_coreg_enable:
                 se_coreg_loss = se_coreg
@@ -1690,7 +1692,14 @@ class Runner:
             #total loss
             # loss = rgbloss * (1.0 - curr_ssim_lambda) + (ssimloss * curr_ssim_lambda) + (dino_loss * cfg.dino_lambda) + (transient_loss * cfg.transient_lambda) + (self.cfg.se_coreg_lambda * se_coreg_loss)
             # loss = rgbloss * (1.0 - lambda_p) + (lambda_p * se_coreg_loss) + (dino_loss *(lambda_p)) + (transient_loss * lambda_p)
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + (transient_loss * lambda_p)  
+            # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + (transient_loss * lambda_p)  
+
+            if step >= cfg.transient_loss_start_iter:
+                transient_loss_weighted = transient_loss
+            else:
+                transient_loss_weighted = 0.0  # main loss에는 반영 안 함 (하지만 transient_model은 계속 학습됨)
+            #total loss            
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + transient_loss_weighted * lambda_p + se_coreg_loss * lambda_p # tag
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward(retain_graph = True)
