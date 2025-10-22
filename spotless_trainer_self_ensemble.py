@@ -193,7 +193,7 @@ class Config:
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
     dino_loss_flag: bool = False
-    dino_loss_lambda: float = 0.7 #tag
+    dino_loss_lambda: float = 0.9 #tag
     
 
     #parameter for self-ensemble-revised-1013
@@ -1918,7 +1918,7 @@ class Runner:
                         low_visibility_mask = gaussian_visibility_ratio < cfg.gaussian_visibility_thresh
                         if low_visibility_mask.any():
                             # Use _decay_opacity function with stronger decay 
-                            self._decay_opacity(low_visibility_mask, factor=0.8)
+                            self._decay_opacity(low_visibility_mask, factor=0.005)
                             print(f"Adjusted opacity for {low_visibility_mask.sum().item()} low-visibility Gaussians")
                     
 
@@ -1941,16 +1941,18 @@ class Runner:
                         means3d = self.splats["means3d"]  # [num_gaussians, 3]
                         dists = torch.norm(means3d - curr_cam_pos[None, :], dim=1)  # [num_gaussians]
                         is_2close = dists < 0.02 * self.scene_scale  # threshold configurable
+                        is_prune = is_prune | is_2close
+                        print(f"  -> Marked {is_2close.sum().item()} Gaussians too close to pseudo views for pruning")
 #-----------------------------------------------------------------------------------------------------
 #revised-1016       # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
                     # 1. Depth-based floater detection 
-                        dyn_mask_2d = binary_mask.squeeze(-1) if binary_mask.dim() == 4 else binary_mask
-                        depth_floaters = self._detect_depth_inconsistent_gaussians(
-                            curr_c2w, curr_K, width, height, dyn_mask_2d, depth_threshold=cfg.depth_floater_thresh #take pseudo view camera to this.
-                        )
-                        if depth_floaters.any():
-                            is_prune = is_prune | is_2close | depth_floaters
-                            print(f"  -> Marked {depth_floaters.sum().item()} depth-inconsistent floaters")
+                        # dyn_mask_2d = binary_mask.squeeze(-1) if binary_mask.dim() == 4 else binary_mask
+                        # depth_floaters = self._detect_depth_inconsistent_gaussians(
+                        #     curr_c2w, curr_K, width, height, dyn_mask_2d, depth_threshold=cfg.depth_floater_thresh #take pseudo view camera to this.
+                        # )
+                        # if depth_floaters.any():
+                        #     is_prune = is_prune | (is_2close & depth_floaters)
+                        #     print(f"  -> Marked {depth_floaters.sum().item()} depth-inconsistent floaters")
                     
                     
                     # 2. Inpaint dynamic regions (후기에만, pruning 후)
@@ -1958,7 +1960,7 @@ class Runner:
                         if step % cfg.refine_every == 0:
                             print("[Ghost Fix] Inpainting dynamic regions...")
                             n_inpainted = self._inpaint_dynamic_regions(
-                                binary_mask, camtoworlds, inpaint_strength=0.7
+                                binary_mask, camtoworlds, inpaint_strength=1.0
                             )
                             if n_inpainted > 0:
                                 print(f"  -> Inpainted {n_inpainted} background Gaussians into dynamic regions")
