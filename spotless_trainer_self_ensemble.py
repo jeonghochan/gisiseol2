@@ -1281,12 +1281,74 @@ class Runner:
             perm = torch.randperm(bg_indices.numel(), device=device)
             to_copy = bg_indices[perm[:n_to_copy]]
             
-            # 복제 (refine_duplicate 사용)
-            copy_mask = torch.zeros(len(means3d), dtype=torch.bool, device=device)
+            # 분할(splitting): 선택한 배경 가우시안을 복제하고,
+            # 원본과 복제본 모두에 가우시안 노이즈를 주입해 동적 영역으로 확장
+            N_before = len(means3d)
+            copy_mask = torch.zeros(N_before, dtype=torch.bool, device=device)
             copy_mask[to_copy] = True
             self.refine_duplicate(copy_mask)
-            
-            return n_to_copy
+
+            # 새로 생성된 가우시안 인덱스 계산
+            N_after = len(self.splats["means3d"])  # 업데이트된 길이
+            new_created = N_after - N_before
+            if new_created <= 0:
+                return 0
+            # 일반적으로 refine_duplicate는 선택된 각 항목을 1개씩 복제한다고 가정
+            new_indices = torch.arange(N_after - new_created, N_after, device=device)
+
+            # 원본+복제본 모두에 노이즈 주입
+            cfg = self.cfg
+            idx_all = torch.cat([to_copy, new_indices])
+
+            # 노이즈 스케일(안전한 기본값 제공, cfg에서 덮어쓰기 가능)
+            pos_sigma   = float(getattr(cfg, "split_pos_noise", 0.01)) * float(self.scene_scale)
+            scale_sigma = float(getattr(cfg, "split_scale_noise", 0.05))
+            quat_sigma  = float(getattr(cfg, "split_quat_noise", 0.02))
+            alpha_sigma = float(getattr(cfg, "split_alpha_noise", 0.02))
+            sh_sigma    = float(getattr(cfg, "split_sh_noise", 0.02))
+            feat_sigma  = float(getattr(cfg, "split_feature_noise", 0.01))
+
+            # means3d: 위치 노이즈
+            if "means3d" in self.splats:
+                m = self.splats["means3d"].data
+                m[idx_all] = m[idx_all] + torch.randn_like(m[idx_all]) * pos_sigma
+
+            # scales: log-space 노이즈(과도한 폭주 방지 위해 클램프)
+            if "scales" in self.splats:
+                s = self.splats["scales"].data
+                s[idx_all] = s[idx_all] + torch.randn_like(s[idx_all]) * scale_sigma
+                s[idx_all] = torch.clamp(s[idx_all], min=-5.0, max=5.0)  # exp 후 합리적 범위 유지를 위한 로그 스페이스 클램프
+
+            # quats: 소규모 노이즈 후 정규화
+            if "quats" in self.splats:
+                q = self.splats["quats"].data
+                q[idx_all] = q[idx_all] + torch.randn_like(q[idx_all]) * quat_sigma
+                q[idx_all] = q[idx_all] / (q[idx_all].norm(dim=-1, keepdim=True) + 1e-8)
+
+            # opacities: 알파 도메인에서 노이즈 → 다시 로그잇으로
+            if "opacities" in self.splats:
+                opa = self.splats["opacities"].data
+                alpha = torch.sigmoid(opa[idx_all])
+                alpha = alpha + torch.randn_like(alpha) * alpha_sigma
+                alpha = torch.clamp(alpha, 1e-6, 1 - 1e-6)
+                opa[idx_all] = torch.logit(alpha)
+
+            # SH 계수 또는 색/특징에 노이즈
+            if "sh0" in self.splats:
+                sh0 = self.splats["sh0"].data
+                sh0[idx_all] = sh0[idx_all] + torch.randn_like(sh0[idx_all]) * sh_sigma
+            if "shN" in self.splats:
+                shN = self.splats["shN"].data
+                shN[idx_all] = shN[idx_all] + torch.randn_like(shN[idx_all]) * sh_sigma
+            if "colors" in self.splats:
+                cols = self.splats["colors"].data
+                cols[idx_all] = cols[idx_all] + torch.randn_like(cols[idx_all]) * sh_sigma
+            if "features" in self.splats:
+                feats = self.splats["features"].data
+                feats[idx_all] = feats[idx_all] + torch.randn_like(feats[idx_all]) * feat_sigma
+
+            # 실제로 분할된 개수 반환(보호적으로 계산)
+            return int(min(n_to_copy, new_created))
         
         return 0
 #-------------------------------------------------------------------------------------------------------------------------
@@ -1874,26 +1936,21 @@ class Runner:
                         is_prune = is_prune | is_too_big
                         
 #revised-1015 ---------------------------------------------------------------------------------------------------
-                    if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter:
+                    if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter and step % cfg.refine_every == 0:
                         curr_cam_pos = curr_c2w[0, :3, 3]  # [3]
                         means3d = self.splats["means3d"]  # [num_gaussians, 3]
                         dists = torch.norm(means3d - curr_cam_pos[None, :], dim=1)  # [num_gaussians]
                         is_2close = dists < 0.02 * self.scene_scale  # threshold configurable
-                        is_prune = is_prune | is_2close
 #-----------------------------------------------------------------------------------------------------
-#revised-1016
-                    # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
+#revised-1016       # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
                     # 1. Depth-based floater detection 
-                    if cfg.enable_depth_floater_detection and step >= cfg.dynamic_prune_start_iter: #pseudo view 시작 이후
-                        if step % cfg.refine_every == 0: 
-                            print("[Floater Detection] Running depth-based detection...")
-                            dyn_mask_2d = binary_mask.squeeze(-1) if binary_mask.dim() == 4 else binary_mask
-                            depth_floaters = self._detect_depth_inconsistent_gaussians(
-                                curr_c2w, curr_K, width, height, dyn_mask_2d, depth_threshold=cfg.depth_floater_thresh #take pseudo view camera to this.
-                            )
-                            if depth_floaters.any():
-                                is_prune = is_prune | depth_floaters
-                                print(f"  -> Marked {depth_floaters.sum().item()} depth-inconsistent floaters")
+                        dyn_mask_2d = binary_mask.squeeze(-1) if binary_mask.dim() == 4 else binary_mask
+                        depth_floaters = self._detect_depth_inconsistent_gaussians(
+                            curr_c2w, curr_K, width, height, dyn_mask_2d, depth_threshold=cfg.depth_floater_thresh #take pseudo view camera to this.
+                        )
+                        if depth_floaters.any():
+                            is_prune = is_2close & depth_floaters
+                            print(f"  -> Marked {depth_floaters.sum().item()} depth-inconsistent floaters")
                     
                     
                     # 2. Inpaint dynamic regions (후기에만, pruning 후)
