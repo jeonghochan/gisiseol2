@@ -193,7 +193,7 @@ class Config:
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
     dino_loss_flag: bool = False
-    dino_loss_lambda: float = 0.7
+    dino_loss_lambda: float = 0.7 #tag
     
 
     #parameter for self-ensemble-revised-1013
@@ -1761,7 +1761,7 @@ class Runner:
             else:
                 transient_loss_weighted = 0.0  # main loss에는 반영 안 함 (하지만 transient_model은 계속 학습됨)
             #total loss            
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + transient_loss_weighted * lambda_p + se_coreg_loss * lambda_p # tag
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + transient_loss_weighted * lambda_p # tag
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward(retain_graph = True)
@@ -1949,7 +1949,7 @@ class Runner:
                             curr_c2w, curr_K, width, height, dyn_mask_2d, depth_threshold=cfg.depth_floater_thresh #take pseudo view camera to this.
                         )
                         if depth_floaters.any():
-                            is_prune = is_2close & depth_floaters
+                            is_prune = is_prune | is_2close | depth_floaters
                             print(f"  -> Marked {depth_floaters.sum().item()} depth-inconsistent floaters")
                     
                     
