@@ -1,0 +1,134 @@
+# SpotLessSplats Self-Ensemble Trainer Configuration Template
+# All parameters with their default values
+
+# ============ Basic Settings ============
+disable_viewer: false
+ckpt: null  # Path to checkpoint file (.pt) for evaluation only
+
+# ============ Data Settings ============
+data_dir: "examples/datasets/data/3DPW/outdoors_crosscountry_00/undistorted/"
+data_factor: 4
+normalize: true
+result_dir: "output/test/maskadaptation21_se-gs_adaptation-opacity10"
+test_every: 8
+train_keyword: "clutter"
+test_keyword: "extra"
+semantics: true
+cluster: false
+patch_size: null  # Random crop size for training (experimental)
+global_scale: 1.0
+
+# ============ Viewer Settings ============
+port: 8080
+
+# ============ Training Settings ============
+batch_size: 1
+steps_scaler: 1.0
+min_steps: 7000
+max_steps: 30000
+eval_steps: [7000, 30000]
+save_steps: [7000, 30000]
+
+# ============ Initialization Settings ============
+init_type: "sfm"  # "sfm" or "random"
+init_num_pts: 100000  # Ignored if using sfm
+init_extent: 3.0  # Ignored if using sfm
+sh_degree: 3
+sh_degree_interval: 1000
+init_opa: 0.1
+init_scale: 1.0
+
+# ============ Loss Settings ============
+ssim_lambda: 0.0
+loss_type: "robust"  # "l1" or "robust"
+robust_percentile: 0.7
+schedule: true
+schedule_beta: -0.003
+lower_bound: 0.5
+upper_bound: 0.9
+bin_size: 10000
+
+# ============ Rendering Settings ============
+near_plane: 0.01
+far_plane: 10000000000.0
+
+# ============ Gaussian Refinement Settings ============
+prune_opa: 0.005
+grow_grad2d: 0.0002
+grow_scale3d: 0.01
+prune_scale3d: 0.1
+refine_start_iter: 500
+refine_stop_iter: 20000
+reset_every: 300000
+refine_every: 100
+reset_sh: 8002
+packed: false
+sparse_grad: false
+absgrad: false
+ubp: false
+ubp_thresh: 0.0000000000001
+antialiased: false
+
+# ============ Training Options ============
+random_bkgd: false
+
+# ============ Camera Pose Optimization ============
+pose_opt: false
+pose_opt_lr: 0.00001
+pose_opt_reg: 0.000001
+pose_noise: 0.0
+
+# ============ Appearance Optimization ============
+app_opt: false
+app_embed_dim: 16
+app_opt_lr: 0.001
+app_opt_reg: 0.000001
+
+# ============ Depth Loss (experimental) ============
+depth_loss: false
+depth_lambda: 0.01
+
+# ============ TensorBoard Settings ============
+tb_every: 100
+tb_save_image: false
+
+# ============ Mask Settings ============
+mask_dir: "examples/datasets/data/3DPW/outdoors_crosscountry_00/undistorted/binary_mask/"  # Path to mask directory
+pseudo_gt_dir: null  # Path to pseudo GT directory
+
+# ============ MLP and Loss Weights ============
+mlp_gt_lambda: 0.1
+dino_loss_flag: false
+dino_loss_lambda: 0.2
+
+# ============ Self-Ensemble Parameters ============
+# Mask mode (dynamic mask overlap ratio)
+uap_dyn_overlap_frac: 0.15
+# Perturbation schedule
+uap_noise_init: 0.12
+uap_noise_final: 0.03
+uap_noise_anneal_end: 20000
+# Self-ensemble co-registration
+se_coreg_enable: true
+se_coreg_lambda: 0.5
+se_pseudo_K: 2  # Number of pseudo views
+# Fallback jitter (if not using PseudoCamera)
+se_jitter_deg: 1.0
+se_jitter_trans: 0.01
+
+# ============ Opacity-Based Pruning ============
+gaussian_visibility_thresh: 0.05
+start_pseudo_view_iter: 7000
+
+# ============ Advanced Floater Detection ============
+enable_depth_floater_detection: true
+depth_floater_thresh: 0.005
+# Ghost/Transparency Artifact Fix
+dynamic_prune_start_iter: 15000
+enable_dynamic_inpainting: true
+
+# ============ Transient Parameters ============
+transient_training_enable: false
+transient_loss_start_iter: 7000
+KL_threshold: 0.5
+

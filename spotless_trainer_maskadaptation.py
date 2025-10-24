@@ -35,7 +35,7 @@ from utils import (
 
 from gsplat.rendering import rasterization
 from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead
-from cameras import Camera, PseudoCamera
+# from cameras import Camera, PseudoCamera
 
 
 @dataclass
@@ -190,7 +190,7 @@ class Config:
     # Weight for MLP mask loss
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
-    dino_lambda: float = 0.2  
+    dino_lambda: float = 0.3  
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -762,7 +762,7 @@ class Runner:
                 ramp_end = int(0.5 * cfg.max_steps) 
                 t = min(step / max(ramp_end, 1), 1.0)
                 wt = 0.5 - 0.5 * math.cos(math.pi * t) 
-                return wt * cfg.ssim_lambda
+                return wt* cfg.ssim_lambda
     
     #revised
     def masked_ssim(self, img1, img2, mask, window_size=11, C1=0.01**2, C2=0.03**2):
@@ -989,7 +989,7 @@ class Runner:
                 self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
 
             # self hard coded control
-            mask_adaptation = True
+            mask_adaptation = False
 
             # 1) DINO 토큰 추출 (GT/Render)  **no no_grad()**  ← 그래디언트가 colors까지 흘러가야 함
             gt_chw     = pixels.permute(0, 3, 1, 2)    # [B,3,H,W], GT

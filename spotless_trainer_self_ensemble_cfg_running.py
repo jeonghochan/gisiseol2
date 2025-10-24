@@ -2,7 +2,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple
 import cv2
 import shutil
@@ -13,7 +13,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
-import tyro
+# import tyro
+import argparse
+import yaml
 import viser
 import nerfview
 from datasets.colmap import Dataset, Parser, ClutterDataset, SemanticParser
@@ -191,9 +193,10 @@ class Config:
 
     # Weight for MLP mask loss
     mlp_gt_lambda: float = 0.1
+
     # Weight for DINO feature loss
-    dino_loss_flag: bool = True
-    dino_loss_lambda: float = 0.2 #tag
+    dino_loss_flag: bool = False
+    dino_loss_lambda: float = 0.2 
     
 
     #parameter for self-ensemble-revised-1013
@@ -232,7 +235,6 @@ class Config:
     transient_training_enable: bool =False    # on/off
     transient_loss_start_iter: int = 7000     # iteration부터 main loss에 transient loss 적용
     KL_threshold: float = 0.5           # KL divergence threshold for masking
-    schedule_beta: float = -3e-3        # Alpha sampling schedule rate
 
   
 
@@ -499,20 +501,20 @@ class Runner:
         # T-3DGS transient model initialization
         
         # Initialize DINO extractor and head before transient model
-        self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
-        self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
+        # self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
+        # self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
 
-        self.transient_model = None
-        self.transient_optimizer = None
-        self.transient_scheduler = None
+        # self.transient_model = None
+        # self.transient_optimizer = None
+        # self.transient_scheduler = None
 
-        # transient model initialization
-        self.transient_model = ConvDPT(self.dino_extractor.dino_model.embed_dim).to(self.device)
-        self.transient_model.train()
-        self.transient_optimizer = torch.optim.Adam(self.transient_model.parameters(), lr=5e-3)
-        self.transient_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.transient_optimizer, cfg.max_steps, 2e-4
-        )
+        # # transient model initialization
+        # self.transient_model = ConvDPT(self.dino_extractor.dino_model.embed_dim).to(self.device)
+        # self.transient_model.train()
+        # self.transient_optimizer = torch.optim.Adam(self.transient_model.parameters(), lr=5e-3)
+        # self.transient_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     self.transient_optimizer, cfg.max_steps, 2e-4
+        # )
 #------------------------------------------------------------------------------------------------------------
         # Viewer
         if not self.cfg.disable_viewer:
@@ -1534,8 +1536,8 @@ class Runner:
             
             # revised
             #--------------------------------------------------------------------------------------------------------------------------------------------
-            if cfg.dino_loss_flag:
-                # 0) lazy init (한 번만 만들기)
+            # 0) lazy init (한 번만 만들기)
+            if cfg.dino_loss_flag :
                 if not hasattr(self, "dino_extractor"):
                     self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
                 if not hasattr(self, "dino_head"):
@@ -1557,12 +1559,11 @@ class Runner:
                 # Extract tokens for GT and render. Avoid overwriting tokens under
                 # a torch.no_grad() context so that gradients can flow into the
                 # upsample head / render path if desired.
-                with torch.no_grad():
-                    ftok, Th, Tw, _, _ = self.dino_extractor.extract_tokens(gt_chw)
-                    if mask_adaptation and (binary_mask is not None):
-                        fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw_safe)
-                    else:
-                        fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
+                ftok, Th, Tw, _, _ = self.dino_extractor.extract_tokens(gt_chw)
+                if mask_adaptation and (binary_mask is not None):
+                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw_safe)
+                else:
+                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
 
                 assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
                 B, _, C = ftok.shape
@@ -1594,7 +1595,7 @@ class Runner:
                     dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
 
             if cfg.dino_loss_flag :
-                # print("DINO loss computation is activated.")
+                print("DINO loss computation is activated.")
                 dino_loss =  dino_feat_loss
             else:
                 dino_loss = 0.0
@@ -1709,7 +1710,8 @@ class Runner:
 #revised-1013
             # ---------------- Self-Ensemble: pseudo-view render↔render loss ----------------
             se_coreg = torch.tensor(0.0, device=device)
-            if self.cfg.se_coreg_enable and binary_mask is not None:
+            if self.cfg.se_coreg_enable and binary_mask is not None and step % cfg.refine_every == 0:
+                print("Self-ensemble coreg loss computation is activated.")    
 
                 # (1) pseudo views 만들기
                 pv_c2w, pv_K = self._make_pseudo_views(camtoworlds, Ks, self.cfg.se_pseudo_K)
@@ -2663,6 +2665,46 @@ class Runner:
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
 
+#revised-1024
+def load_config(config_path: str) -> Config:
+    """Load configuration from YAML or JSON file."""
+    config_path = Path(config_path)
+    
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    # Load the file based on extension
+    if config_path.suffix in ['.yaml', '.yml']:
+        with open(config_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+    elif config_path.suffix == '.json':
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+    else:
+        raise ValueError(f"Unsupported config file format: {config_path.suffix}. Use .yaml, .yml, or .json")
+    
+    # Create Config object from dictionary
+    return Config(**config_dict)
+
+
+def save_config_template(output_path: str):
+    """Save a template configuration file."""
+    cfg = Config()  # Default config
+    config_dict = asdict(cfg)
+    
+    output_path = Path(output_path)
+    
+    if output_path.suffix in ['.yaml', '.yml']:
+        with open(output_path, 'w') as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+    elif output_path.suffix == '.json':
+        with open(output_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
+    else:
+        raise ValueError(f"Unsupported file format: {output_path.suffix}. Use .yaml, .yml, or .json")
+    
+    print(f"Template config saved to: {output_path}")
+#-------------------------------------------------------------
 
 def main(cfg: Config):
     runner = Runner(cfg)
@@ -2683,6 +2725,24 @@ def main(cfg: Config):
 
 
 if __name__ == "__main__":
-    cfg = tyro.cli(Config)
-    cfg.adjust_steps(cfg.steps_scaler)
-    main(cfg)
+    #CHANGED for template config creation
+    parser = argparse.ArgumentParser(description="SpotLessSplats Trainer with Self-Ensemble")
+    parser.add_argument("--config", type=str, required=True, 
+                       help="Path to config YAML file ")
+    parser.add_argument("--create-template", type=str, default=None,
+                       help="Create a template config file at the specified path and exit")
+    
+    args = parser.parse_args()
+    
+    # If user wants to create a template config
+    if args.create_template:
+        save_config_template(args.create_template)
+    else:
+        # Load config from file
+        cfg = load_config(args.config)
+        cfg.adjust_steps(cfg.steps_scaler)
+        
+        print(f"Loaded configuration from: {args.config}")
+        print(f"Result directory: {cfg.result_dir}")
+        
+        main(cfg)
