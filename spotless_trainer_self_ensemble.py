@@ -131,7 +131,7 @@ class Config:
     # Start refining GSs after this iteration
     # Stop refining GSs after this iteration
     refine_start_iter: int = 500
-    refine_stop_iter: int = 30000 # tag
+    refine_stop_iter: int = 20000 # tag
     # Reset opacities every this steps
     reset_every: int = 300000
     # Refine GSs every this steps
@@ -193,7 +193,7 @@ class Config:
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
     dino_loss_flag: bool = False
-    dino_loss_lambda: float = 0.9 #tag
+    dino_loss_lambda: float = 0.2 #tag
     
 
     #parameter for self-ensemble-revised-1013
@@ -203,9 +203,9 @@ class Config:
     # 공통: 섭동 크기 스케줄
     uap_noise_init: float = 0.12            # 초기 섭동 강도 (0.08 -> 0.12로 증가)
     uap_noise_final: float = 0.03           # 최종 섭동 강도 (0.02 -> 0.03로 증가)
-    uap_noise_anneal_end: int = 15000      # 이 step까지 선형 점감
+    uap_noise_anneal_end: int = 20000      # 이 step까지 선형 점감
 
-    se_coreg_enable: bool = False
+    se_coreg_enable: bool = True
     se_coreg_lambda: float = 0.5            # render↔render loss 계수
     se_pseudo_K: int = 2                    # pseudo view 개수
     # fallback jitter (cameras.PseudoCamera 미사용시)
@@ -229,7 +229,7 @@ class Config:
     #--------------------------------------------------------------
     #revised-1017
     # Transient parameters
-    transient_training_enable: bool = True    # on/off
+    transient_training_enable: bool =False    # on/off
     transient_loss_start_iter: int = 7000     # iteration부터 main loss에 transient loss 적용
     KL_threshold: float = 0.5           # KL divergence threshold for masking
     schedule_beta: float = -3e-3        # Alpha sampling schedule rate
@@ -1065,7 +1065,7 @@ class Runner:
             frac = dyn_overlap / float(cover)
             if frac >= self.cfg.uap_dyn_overlap_frac:
                 reset_mask[gi] = True
-        print("find reset gaussans by mask func are working")
+        # print("find reset gaussans by mask func are working")
         return reset_mask
 
     @torch.no_grad()
@@ -1266,7 +1266,7 @@ class Runner:
             static_ratio = w_stat / total_w
             
             # 주로 정적 영역에 나타나는 Gaussian (>80%)
-            is_background = static_ratio > 0.9
+            is_background = static_ratio > 0.8
             
             # 이 중 일부를 복제하여 동적 영역으로 확장
             bg_indices = torch.where(is_background)[0]
@@ -1592,6 +1592,7 @@ class Runner:
                 dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
 
             if cfg.dino_loss_flag :
+                print("DINO loss computation is activated.")
                 dino_loss =  dino_feat_loss
             else:
                 dino_loss = 0.0
@@ -1603,6 +1604,7 @@ class Runner:
             transient_loss = 0.0
 
             if cfg.transient_training_enable and binary_mask is not None:  # transient 활성화 조건
+                print("Transient loss computation is activated.")
                 # 1) 입력 텐서 준비 (DETACH): ConvDPT만 학습되도록 렌더 경로 차단
                 gt_chw_det     = gt_chw.detach()       # [B,3,H,W]
                 render_chw_det = render_chw.detach()   # [B,3,H,W]
@@ -1752,7 +1754,7 @@ class Runner:
             #need scheduler
             lambda_p = self.get_ssim_lambda(step)
             #total loss
-            # loss = rgbloss * (1.0 - curr_ssim_lambda) + (ssimloss * curr_ssim_lambda) + (dino_loss * cfg.dino_lambda) + (transient_loss * cfg.transient_lambda) + (self.cfg.se_coreg_lambda * se_coreg_loss)
+            # loss = rgbloss * (1.0 - curr_ssim_lambda) + (ssimloss * curr_ssim_lambda) + (f * cfg.dino_lambda) + (transient_loss * cfg.transient_lambda) + (self.cfg.se_coreg_lambda * se_coreg_loss)
             # loss = rgbloss * (1.0 - lambda_p) + (lambda_p * se_coreg_loss) + (dino_loss *(lambda_p)) + (transient_loss * lambda_p)
             # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + (transient_loss * lambda_p)  
 
@@ -1761,7 +1763,7 @@ class Runner:
             else:
                 transient_loss_weighted = 0.0  # main loss에는 반영 안 함 (하지만 transient_model은 계속 학습됨)
             #total loss            
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + transient_loss_weighted * lambda_p # tag
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p # tag
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward(retain_graph = True)
@@ -1845,81 +1847,81 @@ class Runner:
                     )
                     
 #revised-1015---------------------------------------------------------------------------------------------------
-                    # test camera pose들에 대한 pseudo view 생성 및 저장
-                    # Trajectory의 초반과 후반부 카메라 포즈 생성
-                    if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter:
-                        print("Generating trajectory start and end poses for pseudo views...")
+                    # # test camera pose들에 대한 pseudo view 생성 및 저장
+                    # # Trajectory의 초반과 후반부 카메라 포즈 생성
+                    # if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter and step % cfg.refine_every == 0:
+                    #     print("Generating trajectory start and end poses for pseudo views...")
 
-                        # parser에서 직접 카메라 포즈 가져오기
-                        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-                        camtoworlds = get_ordered_poses(self.parser.camtoworlds)
-                        camtoworlds = torch.from_numpy(camtoworlds).float().to(device)  # [N, 4, 4]
+                    #     # parser에서 직접 카메라 포즈 가져오기
+                    #     K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+                    #     camtoworlds = get_ordered_poses(self.parser.camtoworlds)
+                    #     camtoworlds = torch.from_numpy(camtoworlds).float().to(device)  # [N, 4, 4]
 
 
                     
-                        # 전체 카메라 수의 20%를 초반과 후반에서 각각 선택
-                        n_views = len(camtoworlds)
-                        n_select = max(1, int(n_views * 0.2))  # 최소 1개는 선택
+                    #     # 전체 카메라 수의 20%를 초반과 후반에서 각각 선택
+                    #     n_views = len(camtoworlds)
+                    #     n_select = max(1, int(n_views * 0.2))  # 최소 1개는 선택
 
-                        # 초반부와 후반부 카메라 포즈 선택
-                        start_poses = camtoworlds[:n_select]  # 처음 20%
-                        end_poses = camtoworlds[-n_select:]   # 마지막 20%
+                    #     # 초반부와 후반부 카메라 포즈 선택
+                    #     start_poses = camtoworlds[:n_select]  # 처음 20%
+                    #     end_poses = camtoworlds[-n_select:]   # 마지막 20%
 
-                        # 선택된 포즈들 결합
-                        selected_poses = torch.cat([start_poses, end_poses], dim=0)  # [2*n_select, 4, 4]
-                        selected_Ks = K.unsqueeze(0).repeat(len(selected_poses), 1, 1)  # [2*n_select, 3, 3]
+                    #     # 선택된 포즈들 결합
+                    #     selected_poses = torch.cat([start_poses, end_poses], dim=0)  # [2*n_select, 4, 4]
+                    #     selected_Ks = K.unsqueeze(0).repeat(len(selected_poses), 1, 1)  # [2*n_select, 3, 3]
 
             
-                        # 각 선택된 포즈에 대해 K개의 pseudo view 생성
-                        pseudo_camtoworlds, pseudo_Ks = self._make_pseudo_views(
-                            selected_poses, 
-                            selected_Ks, 
-                            self.cfg.se_pseudo_K
-                        )
+                    #     # 각 선택된 포즈에 대해 K개의 pseudo view 생성
+                    #     pseudo_camtoworlds, pseudo_Ks = self._make_pseudo_views(
+                    #         selected_poses, 
+                    #         selected_Ks, 
+                    #         self.cfg.se_pseudo_K
+                    #     )
 
-                        # tag visiblity per gaussians
-                        # Initialize Gaussian tracking
-                        num_gaussians = len(self.splats["means3d"])
-                        gaussian_render_counts = torch.zeros(num_gaussians, device=device)
+                    #     # tag visiblity per gaussians
+                    #     # Initialize Gaussian tracking
+                    #     num_gaussians = len(self.splats["means3d"])
+                    #     gaussian_render_counts = torch.zeros(num_gaussians, device=device)
 
-                        # Render each pseudo view
-                        for i in range(len(pseudo_camtoworlds)):
-                            # Get camera parameters for this pseudo view
-                            curr_c2w = pseudo_camtoworlds[i:i+1]  # [1, 4, 4]
-                            curr_K = pseudo_Ks[i:i+1]  # [1, 3, 3]
+                    #     # Render each pseudo view
+                    #     for i in range(len(pseudo_camtoworlds)):
+                    #         # Get camera parameters for this pseudo view
+                    #         curr_c2w = pseudo_camtoworlds[i:i+1]  # [1, 4, 4]
+                    #         curr_K = pseudo_Ks[i:i+1]  # [1, 3, 3]
                             
-                            # Render the view
-                            _, _, info = self.rasterize_splats(
-                                camtoworlds=curr_c2w,
-                                Ks=curr_K,
-                                width=width,
-                                height=height,
-                                sh_degree=cfg.sh_degree,
-                                near_plane=cfg.near_plane,
-                                far_plane=cfg.far_plane,
-                                packed=True  # Ensure we get gaussian_ids
-                            )
+                    #         # Render the view
+                    #         _, _, info = self.rasterize_splats(
+                    #             camtoworlds=curr_c2w,
+                    #             Ks=curr_K,
+                    #             width=width,
+                    #             height=height,
+                    #             sh_degree=cfg.sh_degree,
+                    #             near_plane=cfg.near_plane,
+                    #             far_plane=cfg.far_plane,
+                    #             packed=True  # Ensure we get gaussian_ids
+                    #         )
                             
-                            # Track which Gaussians were used in this view
-                            if "gaussian_ids" in info:
-                                gaussian_ids = info["gaussian_ids"].long()  # [nnz]
-                                if gaussian_ids is not None and gaussian_ids.numel() > 0:
-                                    gaussian_render_counts.index_add_(
-                                        0, 
-                                        gaussian_ids, 
-                                        torch.ones_like(gaussian_ids, dtype=torch.float)
-                                    )
+                    #         # Track which Gaussians were used in this view
+                    #         if "gaussian_ids" in info:
+                    #             gaussian_ids = info["gaussian_ids"].long()  # [nnz]
+                    #             if gaussian_ids is not None and gaussian_ids.numel() > 0:
+                    #                 gaussian_render_counts.index_add_(
+                    #                     0, 
+                    #                     gaussian_ids, 
+                    #                     torch.ones_like(gaussian_ids, dtype=torch.float)
+                    #                 )
                     
-                        # Normalize counts to get percentage of views each Gaussian appears in
-                        total_views = len(pseudo_camtoworlds)
-                        gaussian_visibility_ratio = gaussian_render_counts / total_views  # [num_gaussians]
+                    #     # Normalize counts to get percentage of views each Gaussian appears in
+                    #     total_views = len(pseudo_camtoworlds)
+                    #     gaussian_visibility_ratio = gaussian_render_counts / total_views  # [num_gaussians]
                         
-                        #if gaussian_visibility_ratio is less than threshold, decay their opacity
-                        low_visibility_mask = gaussian_visibility_ratio < cfg.gaussian_visibility_thresh
-                        if low_visibility_mask.any():
-                            # Use _decay_opacity function with stronger decay 
-                            self._decay_opacity(low_visibility_mask, factor=0.005)
-                            print(f"Adjusted opacity for {low_visibility_mask.sum().item()} low-visibility Gaussians")
+                    #     #if gaussian_visibility_ratio is less than threshold, decay their opacity
+                    #     low_visibility_mask = gaussian_visibility_ratio < cfg.gaussian_visibility_thresh
+                    #     if low_visibility_mask.any():
+                    #         # Use _decay_opacity function with stronger decay 
+                    #         self._decay_opacity(low_visibility_mask, factor=0.005)
+                    #         print(f"Adjusted opacity for {low_visibility_mask.sum().item()} low-visibility Gaussians")
                     
 
 #---------------------------------------------------------------------------------------------------------------------
@@ -1935,14 +1937,56 @@ class Runner:
                         )
                         is_prune = is_prune | is_too_big
                         
-#revised-1015 ---------------------------------------------------------------------------------------------------
+#revised-1015-1024 ---------------------------------------------------------------------------------------------------
+                    # Prune Gaussians too close to trajectory cameras (매번 다른 궤적 사용)
                     if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter and step % cfg.refine_every == 0:
-                        curr_cam_pos = curr_c2w[0, :3, 3]  # [3]
+                        # 1) Get ordered camera poses
+                        prune_camtoworlds = get_ordered_poses(self.parser.camtoworlds)
+                        
+                        # 2) 매번 다른 샘플링 오프셋 사용 (시간에 따라 변화)
+                        # step에 따라 샘플링 시작점을 순환 (0~19)
+                        offset = (step // cfg.refine_every) % 20
+                        
+                        # 3) 무작위 섭동 추가 (작은 노이즈로 다양한 궤적 생성)
+                        np.random.seed(step)  # step 기반 시드로 재현 가능하지만 매번 다름
+                        # 샘플링된 키프레임 선택 (오프셋 적용)
+                        keyframe_indices = np.arange(offset, len(prune_camtoworlds), 20)
+                        keyframes = prune_camtoworlds[keyframe_indices].copy()
+ 
+                        prune_camtoworlds = generate_interpolated_path(
+                            keyframes, 40, spline_degree=1, smoothness=0.3
+                        )  # [N, 3, 4]
+                        
+                        # 5) 무작위 스케일 변화 추가 (0.9~1.2 범위)
+                        scale_variation = 0.9 + 0.3 * np.random.rand()  # 매번 다른 스케일
+                        
+                        # 6) Add homogeneous coordinates
+                        prune_camtoworlds = np.concatenate(
+                            [
+                                prune_camtoworlds,
+                                np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(prune_camtoworlds), axis=0),
+                            ],
+                            axis=1,
+                        )  # [N, 4, 4]
+                        
+                        # 7) Apply dynamic scale
+                        scale_factor = 1.1 * scale_variation
+                        prune_camtoworlds = prune_camtoworlds * np.reshape([scale_factor, scale_factor, 1, 1], (1, 4, 1))
+                        
+                        # 8) Convert to torch tensor
+                        prune_camtoworlds = torch.from_numpy(prune_camtoworlds).float().to(device)
+                        
+                        # 9) Check distance to ALL trajectory cameras
                         means3d = self.splats["means3d"]  # [num_gaussians, 3]
-                        dists = torch.norm(means3d - curr_cam_pos[None, :], dim=1)  # [num_gaussians]
-                        is_2close = dists < 0.02 * self.scene_scale  # threshold configurable
+                        all_cam_positions = prune_camtoworlds[:, :3, 3]  # [N_traj, 3]
+                        
+                        # Compute minimum distance to any trajectory camera
+                        dists_to_all_cams = torch.cdist(means3d, all_cam_positions)  # [num_gaussians, N_traj]
+                        min_dists = dists_to_all_cams.min(dim=1)[0]  # [num_gaussians]
+                        
+                        is_2close = min_dists < 0.02 * self.scene_scale  # threshold configurable
                         is_prune = is_prune | is_2close
-                        print(f"  -> Marked {is_2close.sum().item()} Gaussians too close to pseudo views for pruning")
+                        print(f"  -> [Offset:{offset}, Scale:{scale_variation:.2f}] Marked {is_2close.sum().item()} Gaussians too close to trajectory cameras for pruning")
 #-----------------------------------------------------------------------------------------------------
 #revised-1016       # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
                     # 1. Depth-based floater detection 
