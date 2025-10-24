@@ -96,9 +96,9 @@ tb_save_image: false
 mask_dir: "examples/datasets/data/3DPW/outdoors_crosscountry_00/undistorted/binary_mask/"  # Path to mask directory
 pseudo_gt_dir: null  # Path to pseudo GT directory
 
-# ============ MLP and Loss Weights ============
+# ============ MLP and DINO Loss Parameters ============
 mlp_gt_lambda: 0.1
-dino_loss_flag: false
+dino_loss_flag: true
 dino_loss_lambda: 0.2
 
 # ============ Self-Ensemble Parameters ============
@@ -109,8 +109,9 @@ uap_noise_init: 0.12
 uap_noise_final: 0.03
 uap_noise_anneal_end: 20000
 # Self-ensemble co-registration
-se_coreg_enable: true
+se_coreg_enable: false
 se_coreg_lambda: 0.5
+se_coreg_start_iter: 7000
 se_pseudo_K: 2  # Number of pseudo views
 # Fallback jitter (if not using PseudoCamera)
 se_jitter_deg: 1.0
@@ -127,8 +128,8 @@ depth_floater_thresh: 0.005
 dynamic_prune_start_iter: 15000
 enable_dynamic_inpainting: true
 
-# ============ Transient Parameters ============
-transient_training_enable: false
+# ============ Transient convdpt model Parameters ============
+transient_training_enable: true
 transient_loss_start_iter: 7000
 KL_threshold: 0.5
 

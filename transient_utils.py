@@ -2,28 +2,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import torchvision.transforms as transforms
+from featup.util import norm, unnorm
 
+class FeatUp_FeatureExtractor:
+    def __init__(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=True).to(device)
+        self.preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            norm
+        ])
+    
+    def extract(self, images):
+        image_prep = self.preprocess(images)
+        with torch.no_grad():
+            features = self.upsampler(image_prep)
+        return features
 
-#revised-0913
-class DinoUpsampleHead(nn.Module):
-    def __init__(self, in_ch: int, mid_ch: int = 256, stages: int = 3):
-        super().__init__()
-        def blk(cin, cout):
-            return nn.Sequential(
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                nn.Conv2d(cin, cout, 3, padding=1),
-                nn.GroupNorm(1, cout),   # LayerNorm([C,H,W]) 대신 안전
-                nn.GELU(),
-            )
-        layers, c = [], in_ch
-        for _ in range(stages):
-            layers.append(blk(c, mid_ch)); c = mid_ch
-        self.stem = nn.Sequential(*layers)
-        self.proj = nn.Conv2d(mid_ch, in_ch, 1)
-
-    def forward(self, x):                 # x: [B, C, Th, Tw]
-        y = self.stem(x)
-        return self.proj(y)               # -> [B, C, H*, W*]
 
 def dilate_mask(x, iterations=1):
     dilated_mask = x.unsqueeze(0).unsqueeze(0)
@@ -56,49 +51,17 @@ def pad_and_unpad(func):
 
     return wrapper
 
-
-#revised-0914
-class DinoFeatureExtractor:
+class DinoFeatureExatractor:
     def __init__(self, model_name = 'dinov2_vits14'):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         dino_model = torch.hub.load('facebookresearch/dinov2', model_name)
         dino_model.eval()
-
-        self.patch_size = 14 if str(model_name).endswith("14") else 16 # for case to change to 16
         
         self.dino_model = dino_model.to(device)
         self.preprocess = transforms.Compose([
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-
-        for p in self.dino_model.parameters(): p.requires_grad_(False) # Freeze DINO
-
-    def extract_tokens(self, image_bchw: torch.Tensor):
-        """
-        image_bchw: [B,3,H,W], [0,1]
-        return:
-          tokens: [B, Th*Tw, C]
-          Th, Tw: token spatial size
-          H,  W : original image size (for later cropping)
-        """
-        B, C, H, W = image_bchw.shape
-        ps = self.patch_size
-        pad_h = (ps - (H % ps)) % ps
-        pad_w = (ps - (W % ps)) % ps
-
-        # right, left only padding
-        if pad_h or pad_w:
-            image_bchw = F.pad(image_bchw, (0, pad_w, 0, pad_h), mode='replicate') 
-
-        img_prep = self.preprocess(image_bchw)
-        # ⚠ no_grad 쓰지 않음: 렌더(colors)로 그라디언트 흘리려면 그래프 유지
-        feats = self.dino_model.forward_features(img_prep)
-        tokens = feats['x_norm_patchtokens']                 # [B, Th*Tw, C]
-        Th = (H + pad_h) // ps
-        Tw = (W + pad_w) // ps
-        return tokens, Th, Tw, H, W
-
 
     def extract(self, image):
         img_prep = self.preprocess(image)
