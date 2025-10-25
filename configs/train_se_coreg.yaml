@@ -9,7 +9,7 @@ ckpt: null  # Path to checkpoint file (.pt) for evaluation only
 data_dir: "examples/datasets/data/3DPW/outdoors_crosscountry_00/undistorted/"
 data_factor: 4
 normalize: true
-result_dir: "output/test/maskadaptation21_se-gs_adaptation-opacity10"
+result_dir: "output/test/maskadaptation21_se-gs_adaptation-opacity11"
 test_every: 8
 train_keyword: "clutter"
 test_keyword: "extra"
