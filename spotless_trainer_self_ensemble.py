@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import tyro
+import argparse
+import yaml
 import viser
 import nerfview
 from datasets.colmap import Dataset, Parser, ClutterDataset, SemanticParser
@@ -34,9 +36,9 @@ from utils import (
 )
 
 from gsplat.rendering import rasterization
-from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead
-from convdpt_module import ConvDPT  # ConvDPT 구현
-# from cameras import Camera, PseudoCamera
+from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead, ConvDPT
+# from transient_utils import ConvDPT
+
 
 
 @dataclass
@@ -205,9 +207,10 @@ class Config:
     uap_noise_final: float = 0.03           # 최종 섭동 강도 (0.02 -> 0.03로 증가)
     uap_noise_anneal_end: int = 20000      # 이 step까지 선형 점감
 
-    se_coreg_enable: bool = True
+    se_coreg_enable: bool = False
     se_coreg_lambda: float = 0.5            # render↔render loss 계수
     se_pseudo_K: int = 2                    # pseudo view 개수
+    se_coreg_start_iter: int = 7000        # self-ensemble 코-레그 시작 스텝
     # fallback jitter (cameras.PseudoCamera 미사용시)
     se_jitter_deg: float = 1.0              # yaw/pitch/roll 표준편차(도)
     se_jitter_trans: float = 0.01           # 번역 표준편차(장면스케일 비율)
@@ -229,7 +232,7 @@ class Config:
     #--------------------------------------------------------------
     #revised-1017
     # Transient parameters
-    transient_training_enable: bool =False    # on/off
+    transient_training_enable: bool =True    # on/off
     transient_loss_start_iter: int = 7000     # iteration부터 main loss에 transient loss 적용
     KL_threshold: float = 0.5           # KL divergence threshold for masking
     schedule_beta: float = -3e-3        # Alpha sampling schedule rate
@@ -937,63 +940,63 @@ class Runner:
 
 
     @torch.no_grad()
-    # def _find_reset_gaussians_by_mask(self, dyn_mask_bhw: torch.Tensor, info: dict) -> torch.Tensor:
-    #     """
-    #     동적 마스크(=0)와의 '실제 splat 픽셀' 겹침 비율로 섭동 대상 선택.
-    #     meta(info)가 packed이고 다음 키들을 제공한다고 가정:
-    #       - 'gaussian_ids' [nnz] : 로컬→전역 인덱스 매핑
-    #       - 'means2d'    [nnz,2] : 2D 중심 (픽셀 or [-1,1] → 아래서 자동 판별)
-    #       - 'conics'     [nnz,2,2] (precision) 또는 제공 안되면 'radii' [nnz]
-    #       - 'tile_width','tile_height','tile_size','isect_offsets'[T+1],'isect_ids'[*]
-    #     반환: [N] boolean mask (전역 인덱스 공간)
-    #     """
-    #     dev = dyn_mask_bhw.device
-    #     N   = len(self.splats["means3d"])
-    #     H   = int(info["height"]); W = int(info["width"])
-    #     tw  = int(info["tile_width"])
-    #     th = int(info["tile_height"])
-    #     ts = int(info["tile_size"])
-    #     #fragment: gaussian-tile 겹침 단위/(가우시안 id, 픽셀 id) 쌍들의 리스트
-    #     #packed: fragment 단위로 정렬/저장 (타일별 fragment 개수 불균일 → fragment별로 속한 타일 id 필요)
-    #     #→ fragment별로 타일 id, 타일 내 픽셀좌표 복원 필요
+    def _find_reset_gaussians_by_mask(self, dyn_mask_bhw: torch.Tensor, info: dict) -> torch.Tensor:
+        """
+        동적 마스크(=0)와의 '실제 splat 픽셀' 겹침 비율로 섭동 대상 선택.
+        meta(info)가 packed이고 다음 키들을 제공한다고 가정:
+          - 'gaussian_ids' [nnz] : 로컬→전역 인덱스 매핑
+          - 'means2d'    [nnz,2] : 2D 중심 (픽셀 or [-1,1] → 아래서 자동 판별)
+          - 'conics'     [nnz,2,2] (precision) 또는 제공 안되면 'radii' [nnz]
+          - 'tile_width','tile_height','tile_size','isect_offsets'[T+1],'isect_ids'[*]
+        반환: [N] boolean mask (전역 인덱스 공간)
+        """
+        dev = dyn_mask_bhw.device
+        N   = len(self.splats["means3d"])
+        H   = int(info["height"]); W = int(info["width"])
+        tw  = int(info["tile_width"])
+        th = int(info["tile_height"])
+        ts = int(info["tile_size"])
+        #fragment: gaussian-tile 겹침 단위/(가우시안 id, 픽셀 id) 쌍들의 리스트
+        #packed: fragment 단위로 정렬/저장 (타일별 fragment 개수 불균일 → fragment별로 속한 타일 id 필요)
+        #→ fragment별로 타일 id, 타일 내 픽셀좌표 복원 필요
 
-    #     ids_full      = info["gaussian_ids"].long().view(-1)   # [nnz] (local→global)
-    #     isect_offsets = info["isect_offsets"].long().view(-1)  # [T+1], T=tw*th
-    #     isect_ids     = info["isect_ids"].long().view(-1)      # [M]   (local gaussian per fragment)
-    #     flatten_ids   = info["flatten_ids"].long().view(-1)    # [M]   (tile-local pixel offset per fragment)
+        ids_full      = info["gaussian_ids"].long().view(-1)   # [nnz] (local→global)
+        isect_offsets = info["isect_offsets"].long().view(-1)  # [T+1], T=tw*th
+        isect_ids     = info["isect_ids"].long().view(-1)      # [M]   (local gaussian per fragment)
+        flatten_ids   = info["flatten_ids"].long().view(-1)    # [M]   (tile-local pixel offset per fragment)
 
-    #     nnz = ids_full.numel()
-    #     if nnz == 0 or isect_ids.numel() == 0:
-    #         return torch.zeros(N, dtype=torch.bool, device=dev)
+        nnz = ids_full.numel()
+        if nnz == 0 or isect_ids.numel() == 0:
+            return torch.zeros(N, dtype=torch.bool, device=dev)
 
-    #     # offsets → 각 fragment가 속한 타일 id 벡터 (벡터화)
-    #     lengths  = (isect_offsets[1:] - isect_offsets[:-1]).clamp_min(0)  # [T]
-    #     tile_ids = torch.repeat_interleave(torch.arange(tw*th, device=dev), lengths)  # [M]
+        # offsets → 각 fragment가 속한 타일 id 벡터 (벡터화)
+        lengths  = (isect_offsets[1:] - isect_offsets[:-1]).clamp_min(0)  # [T]
+        tile_ids = torch.repeat_interleave(torch.arange(tw*th, device=dev), lengths)  # [M]
 
-    #     # 타일 좌표(tx,ty)와 tile-local offset(lx,ly)로부터 전역 픽셀좌표 복원
-    #     tx = tile_ids % tw
-    #     ty = tile_ids // tw
-    #     lx =  flatten_ids % ts
-    #     ly =  flatten_ids // ts
-    #     x  = (tx * ts + lx).clamp_max(W-1)
-    #     y  = (ty * ts + ly).clamp_max(H-1)
-    #     p_lin = (y * W + x)  # [M]
+        # 타일 좌표(tx,ty)와 tile-local offset(lx,ly)로부터 전역 픽셀좌표 복원
+        tx = tile_ids % tw
+        ty = tile_ids // tw
+        lx =  flatten_ids % ts
+        ly =  flatten_ids // ts
+        x  = (tx * ts + lx).clamp_max(W-1)
+        y  = (ty * ts + ly).clamp_max(H-1)
+        p_lin = (y * W + x)  # [M]
 
-    #     # 동적(=0) 플래그를 선형으로 → fragment별 동적 여부로 인덱싱
-    #     dyn_flag_lin = (dyn_mask_bhw[0].reshape(-1) < 0.5).to(torch.int32)  # [H*W]
-    #     frag_dyn     = dyn_flag_lin[p_lin]                                   # [M] {0,1}
+        # 동적(=0) 플래그를 선형으로 → fragment별 동적 여부로 인덱싱
+        dyn_flag_lin = (dyn_mask_bhw[0].reshape(-1) < 0.5).to(torch.int32)  # [H*W]
+        frag_dyn     = dyn_flag_lin[p_lin]                                   # [M] {0,1}
 
-    #     # per-local-gaussian 카운트 (길이 nnz)
-    #     dyn_counts   = torch.bincount(isect_ids, weights=frag_dyn.float(), minlength=nnz)  # [nnz]
-    #     cover_counts = torch.bincount(isect_ids, minlength=nnz).float().clamp_min(1.0)     # [nnz]
-    #     frac_local   = dyn_counts / cover_counts                                           # [nnz]
-    #     sel_local    = (frac_local >= self.cfg.uap_dyn_overlap_frac)                       # [nnz]
+        # per-local-gaussian 카운트 (길이 nnz)
+        dyn_counts   = torch.bincount(isect_ids, weights=frag_dyn.float(), minlength=nnz)  # [nnz]
+        cover_counts = torch.bincount(isect_ids, minlength=nnz).float().clamp_min(1.0)     # [nnz]
+        frac_local   = dyn_counts / cover_counts                                           # [nnz]
+        sel_local    = (frac_local >= self.cfg.uap_dyn_overlap_frac)                       # [nnz]
 
-    #     # packed → 전역 인덱스로 승격
-    #     reset_mask = torch.zeros(N, dtype=torch.bool, device=dev)
-    #     reset_mask[ids_full[sel_local]] = True
-    #     print("reset gaussians by maks works")
-    #     return reset_mask
+        # packed → 전역 인덱스로 승격
+        reset_mask = torch.zeros(N, dtype=torch.bool, device=dev)
+        reset_mask[ids_full[sel_local]] = True
+        print("reset gaussians by maks works")
+        return reset_mask
 
     @torch.no_grad()
     def _find_reset_gaussians_by_mask(self, dyn_mask_bhw: torch.Tensor, info: dict) -> torch.Tensor:
@@ -1603,29 +1606,45 @@ class Runner:
             # T-3DGS Transient Loss with Covariance Parameters
             # transient_model은 항상 학습, 하지만 main loss에 반영은 transient_loss_start_iter 이후부터
 
-            transient_loss = 0.0
+            transient_loss = torch.tensor(0.0, device=device)
 
-            if cfg.transient_training_enable and binary_mask is not None:  # transient 활성화 조건
+            if cfg.transient_training_enable and binary_mask is not None and cfg.transient_loss_start_iter <= step and step % cfg.refine_every ==0:  # transient 활성화 조건
                 print("Transient loss computation is activated.")
                 # 1) 입력 텐서 준비 (DETACH): ConvDPT만 학습되도록 렌더 경로 차단
                 gt_chw_det     = gt_chw.detach()       # [B,3,H,W]
                 render_chw_det = render_chw.detach()   # [B,3,H,W]
                 transient_input = torch.cat((gt_chw_det, render_chw_det), dim=0)  # [2*B,3,H,W]
 
-                 # 2) 공분산 파라미터 예측
+                # 2) 공분산 파라미터 예측
                 # DINO extractor는 가중치 갱신/그래프 연결 불필요 → no_grad
                 with torch.no_grad():
                     _ = self.dino_extractor  # 일부 구현에서 내부 상태 접근을 위해 참조 필요
-                transient_maps = self.transient_model(transient_input, self.dino_extractor)
- 
-                 # GT용 파라미터 (σ1, σ2, ρ)
-                sigma_1 = transient_maps[0][0]  # [B, H, W]
-                sigma_2 = transient_maps[0][1]  # [B, H, W]  
-                rho     = transient_maps[0][2]  # [B, H, W]
+                transient_out = self.transient_model(transient_input, self.dino_extractor)
 
-                s_1 = transient_maps[1][0]  # [B, H, W]
-                s_2 = transient_maps[1][1]  # [B, H, W]
-                r   = transient_maps[1][2]  # [B, H, W]
+                # transient_utils.ConvDPT returns Tensor [2*B, 3, H, W]
+                # convdpt_module.ConvDPT returns tuple/list: ([gt_sigma1,gt_sigma2,gt_rho],[s1,s2,r])
+                if isinstance(transient_out, torch.Tensor):
+                    cov = transient_out
+                    B2 = gt_chw_det.shape[0]
+                    cov_gt = cov[:B2]
+                    cov_render = cov[B2 : B2 * 2]
+
+                    sigma_1 = cov_gt[:, 0]
+                    sigma_2 = cov_gt[:, 1]
+                    rho     = cov_gt[:, 2]
+
+                    s_1 = cov_render[:, 0]
+                    s_2 = cov_render[:, 1]
+                    r   = cov_render[:, 2]
+                else:
+                    transient_maps = transient_out
+                    sigma_1 = transient_maps[0][0]  # [B, H, W]
+                    sigma_2 = transient_maps[0][1]  # [B, H, W]  
+                    rho     = transient_maps[0][2]  # [B, H, W]
+
+                    s_1 = transient_maps[1][0]  # [B, H, W]
+                    s_2 = transient_maps[1][1]  # [B, H, W]
+                    r   = transient_maps[1][2]  # [B, H, W]
                 
                 # 수치 안전화 (양쪽 determinant/분산 모두 clamp)
                 eps = 1e-6
@@ -1671,6 +1690,20 @@ class Runner:
                 transient_loss = transient_energy.mean()
 
 
+                #revised-1017               
+                self.transient_optimizer.zero_grad()
+                # 여기서 사용하는 transient_loss는 위에서 DETACH 입력으로 계산된 것
+                transient_loss.backward()     # ConvDPT 파라미터에만 gradient
+                self.transient_optimizer.step()
+                if self.transient_scheduler is not None:
+                    self.transient_scheduler.step()
+
+            if cfg.transient_training_enable:
+                transient_loss_weighted = transient_loss
+            else:
+                transient_loss_weighted = 0.0 
+
+
 #--------------------------------------------------------------------------------------------------------------------------------------------
 
             #revised
@@ -1709,7 +1742,7 @@ class Runner:
 #revised-1013
             # ---------------- Self-Ensemble: pseudo-view render↔render loss ----------------
             se_coreg = torch.tensor(0.0, device=device)
-            if self.cfg.se_coreg_enable and binary_mask is not None:
+            if self.cfg.se_coreg_enable and binary_mask is not None and cfg.se_coreg_start_iter <= step and step % cfg.refine_every == 0:
 
                 # (1) pseudo views 만들기
                 pv_c2w, pv_K = self._make_pseudo_views(camtoworlds, Ks, self.cfg.se_pseudo_K)
@@ -1744,9 +1777,10 @@ class Runner:
                     delta_imgs = torch.clamp(delta_imgs, 0.0, 1.0)
                 # (4) render↔render photometric (Σ vs Δ) — Δ는 detach
                 se_coreg = F.l1_loss(sigma_imgs, delta_imgs)
-                # print("pseudo view based loss is working")
+                print("pseudo view based loss is working")
                 # (선택) 대칭항 추가를 원하면 아래 주석 해제
                 # se_coreg = 0.5 * (F.l1_loss(sigma_imgs, delta_imgs.detach()) + F.l1_loss(delta_imgs, sigma_imgs.detach()))
+
 
             if cfg.se_coreg_enable:
                 se_coreg_loss = se_coreg
@@ -1760,25 +1794,14 @@ class Runner:
             # loss = rgbloss * (1.0 - lambda_p) + (lambda_p * se_coreg_loss) + (dino_loss *(lambda_p)) + (transient_loss * lambda_p)
             # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + (transient_loss * lambda_p)  
 
-            if step >= cfg.transient_loss_start_iter:
-                transient_loss_weighted = transient_loss
-            else:
-                transient_loss_weighted = 0.0  # main loss에는 반영 안 함 (하지만 transient_model은 계속 학습됨)
+                
             #total loss            
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p # tag
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p +transient_loss_weighted * lambda_p
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward(retain_graph = True)
 
-#revised-1017
-            if cfg.transient_training_enable and self.transient_optimizer is not None and (binary_mask is not None):
-                self.transient_optimizer.zero_grad()
-                # 여기서 사용하는 transient_loss는 위에서 DETACH 입력으로 계산된 것
-                transient_loss.backward()     # ConvDPT 파라미터에만 gradient
-                self.transient_optimizer.step()
-                if self.transient_scheduler is not None:
-                    self.transient_scheduler.step()
-# ----------------------------------------------------------------------------------------------------------------------------
+
 
             desc = f"loss={loss.item():.9f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
