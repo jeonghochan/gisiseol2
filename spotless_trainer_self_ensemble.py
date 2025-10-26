@@ -195,7 +195,7 @@ class Config:
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
     dino_loss_flag: bool = True
-    dino_loss_lambda: float = 0.2 #tag
+    dino_loss_lambda: float = 0.3 #tag
     
 
     #parameter for self-ensemble-revised-1013
@@ -207,10 +207,10 @@ class Config:
     uap_noise_final: float = 0.03           # 최종 섭동 강도 (0.02 -> 0.03로 증가)
     uap_noise_anneal_end: int = 20000      # 이 step까지 선형 점감
 
-    se_coreg_enable: bool = False
+    se_coreg_enable: bool = True
     se_coreg_lambda: float = 0.5            # render↔render loss 계수
     se_pseudo_K: int = 2                    # pseudo view 개수
-    se_coreg_start_iter: int = 7000        # self-ensemble 코-레그 시작 스텝
+    se_coreg_refine_every: int = 200    # self-ensemble 
     # fallback jitter (cameras.PseudoCamera 미사용시)
     se_jitter_deg: float = 1.0              # yaw/pitch/roll 표준편차(도)
     se_jitter_trans: float = 0.01           # 번역 표준편차(장면스케일 비율)
@@ -232,7 +232,7 @@ class Config:
     #--------------------------------------------------------------
     #revised-1017
     # Transient parameters
-    transient_training_enable: bool =True    # on/off
+    transient_training_enable: bool = False    # on/off
     transient_loss_start_iter: int = 7000     # iteration부터 main loss에 transient loss 적용
     KL_threshold: float = 0.5           # KL divergence threshold for masking
     schedule_beta: float = -3e-3        # Alpha sampling schedule rate
@@ -1603,8 +1603,8 @@ class Runner:
                 dino_loss = 0.0
             #--------------------------------------------------------------------------------------------------------------------------------------------
 #revised-1017
-            # T-3DGS Transient Loss with Covariance Parameters
-            # transient_model은 항상 학습, 하지만 main loss에 반영은 transient_loss_start_iter 이후부터
+            # this is not used do to unstable error backpropagation
+            # Todo: transient loss implementation
 
             transient_loss = torch.tensor(0.0, device=device)
 
@@ -1688,6 +1688,7 @@ class Runner:
 
                 # 8) 전체 평균으로 스칼라화
                 transient_loss = transient_energy.mean()
+                transient_loss_weighted = transient_loss
 
 
                 #revised-1017               
@@ -1697,9 +1698,6 @@ class Runner:
                 self.transient_optimizer.step()
                 if self.transient_scheduler is not None:
                     self.transient_scheduler.step()
-
-            if cfg.transient_training_enable:
-                transient_loss_weighted = transient_loss
             else:
                 transient_loss_weighted = 0.0 
 
@@ -1716,6 +1714,7 @@ class Runner:
                 # ssim loss
                 # (Todo) it should be considered to use masked ssim or not
                 # ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
+                # do not use because it allocates a lot of memories (16GB)
                 ssimloss = 1.0 - self.masked_ssim(pixels.permute(0,3,1,2), colors.permute(0,3,1,2), binary_mask.permute(0,3,1,2)) # take all into B C H W
                 
             #depth loss (experimental)
@@ -1742,48 +1741,137 @@ class Runner:
 #revised-1013
             # ---------------- Self-Ensemble: pseudo-view render↔render loss ----------------
             se_coreg = torch.tensor(0.0, device=device)
-            if self.cfg.se_coreg_enable and binary_mask is not None and cfg.se_coreg_start_iter <= step and step % cfg.refine_every == 0:
+            if (
+                self.cfg.se_coreg_enable
+                and binary_mask is not None
+                and cfg.refine_start_iter <= step
+                and step % cfg.se_coreg_refine_every == 0
+            ):
+                # TODO: implement pseudo view selection strategy
+                # to use spotless-mlp classifier pixelwise model trained with binary mask and use that for pseudo view dynamic mask.
 
-                # (1) pseudo views 만들기
-                pv_c2w, pv_K = self._make_pseudo_views(camtoworlds, Ks, self.cfg.se_pseudo_K)
-                # (2) Σ-브랜치: 현재 파라미터로 pseudo view 렌더
-                sigma_imgs, _, sigma_info = self.rasterize_splats(
-                    camtoworlds=pv_c2w, Ks=pv_K, width=width, height=height,
-                    sh_degree=sh_degree_to_use, near_plane=cfg.near_plane, far_plane=cfg.far_plane
-                )
-                sigma_imgs = torch.clamp(sigma_imgs, 0.0, 1.0)  # [K,H,W,3]
-                # (3) Δ-브랜치: 임시 사본 생성 → pseudo에서 동적마스크 겹침기준 reset mask → in-place 경량 섭동
+
+                # (1) Make pseudo views (may return multiple views). Limit to two
+                # pv_c2w, pv_K = self._make_pseudo_views(camtoworlds, Ks, self.cfg.se_pseudo_K)
+
+                # # Ensure torch tensors on device
+                # if isinstance(pv_c2w, np.ndarray):
+                #     pv_c2w_t = torch.from_numpy(pv_c2w).float().to(device)
+                # else:
+                #     pv_c2w_t = pv_c2w
+
+                # if isinstance(pv_K, np.ndarray):
+                #     pv_K_t = torch.from_numpy(pv_K).float().to(device)
+                # else:
+                #     pv_K_t = pv_K
+
+                # if pv_c2w_t.shape[0] < 2:
+                #     se_coreg_loss = 0.0
+                # else:
+                #     pv_c2w_use = pv_c2w_t[:2]
+                #     pv_K_use = pv_K_t[:2]
+
+                    # # convert mask dims safely (used in other parts if needed)
+                    # if binary_mask.shape == (1, height, width, 1):
+                    #     dyn_mask = binary_mask.squeeze(-1)
+                    # else:
+                    #     dyn_mask = binary_mask.permute(0, 3, 1, 2).squeeze(1)
+
+                    # # decide which Gaussians to reset using first pseudo view info
+                    # with torch.no_grad():
+                    #     _, _, info_pv0 = self.rasterize_splats(
+                    #         camtoworlds=pv_c2w_use[0:1],
+                    #         Ks=pv_K_use[0:1],
+                    #         width=width,
+                    #         height=height,
+                    #         sh_degree=sh_degree_to_use,
+                    #         near_plane=cfg.near_plane,
+                    #         far_plane=cfg.far_plane,
+                    #     )
+                    # reset_mask_pv = self._find_reset_gaussians_by_mask(dyn_mask, info_pv0)
+
+                    # # (2) Render sigma (background) under no_grad to avoid storing activations
+                    # with self._temporary_splats(self._clone_splats()):
+                    #     # fully reset dynamic gaussians for background render
+                    #     # self._apply_reset_attributes(reset_mask_pv, 0.0)
+                    #     with torch.no_grad():
+                    #         sigma_imgs, _, _ = self.rasterize_splats(
+                    #             camtoworlds=pv_c2w_use,
+                    #             Ks=pv_K_use,
+                    #             width=width,
+                    #             height=height,
+                    #             sh_degree=sh_degree_to_use,
+                    #             near_plane=cfg.near_plane,
+                    #             far_plane=cfg.far_plane,
+                    #         )
+                    #         sigma_imgs = torch.clamp(sigma_imgs, 0.0, 1.0)
+
+                    # # (3) Render delta (background + small perturb) with gradients enabled
+                    # delta_splats = self._clone_splats()
+                    # with self._temporary_splats(delta_splats):
+                    #     self._apply_reset_attributes(reset_mask_pv, self._uap_noise_ratio(step))
+                    #     delta_imgs, _, _ = self.rasterize_splats(
+                    #         camtoworlds=pv_c2w_use,
+                    #         Ks=pv_K_use,
+                    #         width=width,
+                    #         height=height,
+                    #         sh_degree=sh_degree_to_use,
+                    #         near_plane=cfg.near_plane,
+                    #         far_plane=cfg.far_plane,
+                    #     )
+                    #     delta_imgs = torch.clamp(delta_imgs, 0.0, 1.0)
+
+                    # (4) Compute photometric loss between background-only sigma and perturbed delta.
+                    # Use detach on sigma_imgs (was computed with no_grad()) to be explicit.
+                    # se_coreg = F.l1_loss(sigma_imgs.detach(), delta_imgs.detach())
+                    # se_coreg_loss = se_coreg
+
+
+                ### already exist camera view with delta perturbation model
+
+                if binary_mask.shape == (1, height, width, 1):
+                        dyn_mask = binary_mask.squeeze(-1)
+                else:
+                    dyn_mask = binary_mask.permute(0, 3, 1, 2).squeeze(1)
+                
+                # Render sigma (background) under no_grad to avoid storing activations
+                with self._temporary_splats(self._clone_splats()):
+                    sigma_imgs, _, _ = self.rasterize_splats(
+                        camtoworlds,
+                        Ks,
+                        width=width,
+                        height=height,
+                        sh_degree=sh_degree_to_use,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                    )
+                    sigma_imgs = torch.clamp(sigma_imgs, 0.0, 1.0)
+                
+                reset_mask_pv = self._find_reset_gaussians_by_mask(dyn_mask, info)
+
+                # Render delta (background + small perturb) with gradients enabled
                 delta_splats = self._clone_splats()
 
-                # 마스크 차원 안전하게 변환: [1,H,W,1] → [1,H,W]
-                if binary_mask.shape == (1, height, width, 1):
-                    dyn_mask = binary_mask.squeeze(-1)  # [1,H,W,1] → [1,H,W]
-                else:
-                    dyn_mask = binary_mask.permute(0,3,1,2).squeeze(1)  # 기존 로직
-                # pseudo 중 첫 뷰의 info로 겹침 계산
-                _, _, info_pv0 = self.rasterize_splats(
-                    camtoworlds=pv_c2w[0:1], Ks=pv_K[0:1], width=width, height=height,
-                    sh_degree=sh_degree_to_use, near_plane=cfg.near_plane, far_plane=cfg.far_plane
-                )
-                reset_mask_pv = self._find_reset_gaussians_by_mask(dyn_mask, info_pv0)
-
-                # 임시 Δ 파라미터에만 섭동 적용
                 with self._temporary_splats(delta_splats):
                     self._apply_reset_attributes(reset_mask_pv, self._uap_noise_ratio(step))
-                    delta_imgs, _, _ = self.rasterize_splats(
-                        camtoworlds=pv_c2w, Ks=pv_K, width=width, height=height,
-                        sh_degree=sh_degree_to_use, near_plane=cfg.near_plane, far_plane=cfg.far_plane
-                    )
+                    with torch.no_grad():
+                        delta_imgs, _, _ = self.rasterize_splats(
+                            camtoworlds,
+                            Ks,
+                            width=width,
+                            height=height,
+                            sh_degree=sh_degree_to_use,
+                            near_plane=cfg.near_plane,
+                            far_plane=cfg.far_plane,
+                        )
                     delta_imgs = torch.clamp(delta_imgs, 0.0, 1.0)
-                # (4) render↔render photometric (Σ vs Δ) — Δ는 detach
-                se_coreg = F.l1_loss(sigma_imgs, delta_imgs)
-                print("pseudo view based loss is working")
-                # (선택) 대칭항 추가를 원하면 아래 주석 해제
-                # se_coreg = 0.5 * (F.l1_loss(sigma_imgs, delta_imgs.detach()) + F.l1_loss(delta_imgs, sigma_imgs.detach()))
 
-
-            if cfg.se_coreg_enable:
+                # (4) Compute photometric loss between background-only sigma and perturbed delta.
+                # Use detach on sigma_imgs (was computed with no_grad()) to be explicit.
+                se_coreg = F.l1_loss(sigma_imgs, delta_imgs.detach())
                 se_coreg_loss = se_coreg
+
+
             else:
                 se_coreg_loss = 0.0
 
@@ -1796,11 +1884,11 @@ class Runner:
 
                 
             #total loss            
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p +transient_loss_weighted * lambda_p
+            # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p +transient_loss_weighted * lambda_p
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda )  + se_coreg_loss * cfg.se_coreg_lambda +transient_loss_weighted * lambda_p
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward(retain_graph = True)
-
 
 
             desc = f"loss={loss.item():.9f}| " f"sh degree={sh_degree_to_use}| "
@@ -1993,21 +2081,29 @@ class Runner:
                             ],
                             axis=1,
                         )  # [N, 4, 4]
-                        
+                        # pick one camera
+                        cam_num = np.random.randint(0, len(prune_camtoworlds))
+                        prune_camtoworlds = prune_camtoworlds[cam_num : cam_num + 1]  # [1, 4, 4]
                         # 7) Apply dynamic scale
                         scale_factor = 1.1 * scale_variation
-                        prune_camtoworlds = prune_camtoworlds * np.reshape([scale_factor, scale_factor, 1, 1], (1, 4, 1))
+                        prune_camtoworlds = prune_camtoworlds * np.reshape(
+                            np.array([[scale_factor, scale_factor, scale_factor, 1.0]]), (1, 4, 1)
+                        )
                         
                         # 8) Convert to torch tensor
                         prune_camtoworlds = torch.from_numpy(prune_camtoworlds).float().to(device)
                         
-                        # 9) Check distance to ALL trajectory cameras
-                        means3d = self.splats["means3d"]  # [num_gaussians, 3]
-                        all_cam_positions = prune_camtoworlds[:, :3, 3]  # [N_traj, 3]
+                        # # 9) Check distance to ALL trajectory cameras
+                        # means3d = self.splats["means3d"]  # [num_gaussians, 3]
+                        # all_cam_positions = prune_camtoworlds[:, :3, 3]  # [N_traj, 3]
                         
                         # Compute minimum distance to any trajectory camera
-                        dists_to_all_cams = torch.cdist(means3d, all_cam_positions)  # [num_gaussians, N_traj]
-                        min_dists = dists_to_all_cams.min(dim=1)[0]  # [num_gaussians]
+                        # dists_to_all_cams = torch.cdist(means3d, all_cam_positions)  # [num_gaussians, N_traj]
+                        # min_dists = dists_to_all_cams.min(dim=1)[0]  # [num_gaussians]
+                        means3d = self.splats["means3d"]  # [num_gaussians, 3]
+                        cam_position = prune_camtoworlds[0, :3, 3]  # [3]
+                        dists_to_cam = torch.norm(means3d - cam_position.unsqueeze(0), dim=1)  # [num_gaussians]
+                        min_dists = dists_to_cam  # since only one camera is used
                         
                         is_2close = min_dists < 0.02 * self.scene_scale  # threshold configurable
                         is_prune = is_prune | is_2close
