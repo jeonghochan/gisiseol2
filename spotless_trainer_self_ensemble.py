@@ -207,6 +207,7 @@ class Config:
     uap_noise_final: float = 0.03           # 최종 섭동 강도 (0.02 -> 0.03로 증가)
     uap_noise_anneal_end: int = 20000      # 이 step까지 선형 점감
 
+
     se_coreg_enable: bool = True
     se_coreg_start_iter: int = 7000
     se_coreg_lambda: float = 0.5            # render↔render loss 계수
