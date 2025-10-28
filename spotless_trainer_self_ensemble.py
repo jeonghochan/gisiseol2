@@ -241,7 +241,7 @@ class Config:
     #revised-1028
     # Minimum age (in training steps) before a newly created Gaussian can be
     # pruned. Helps avoid immediate prune after duplication/splitting.
-    min_age_before_prune: int = 3
+    min_age_before_prune: int = 100
 
   
 
@@ -2062,7 +2062,7 @@ class Runner:
                         is_prune = is_prune | is_too_big
                         
 #revised-1015-1024 ---------------------------------------------------------------------------------------------------
-                    # Prune Gaussians too close to trajectory cameras (매번 다른 궤적 사용)
+# Prune Gaussians too close to trajectory cameras (매번 다른 궤적 사용)
                     if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter and step % cfg.refine_every == 0:
                         # 1) Get ordered camera poses
                         prune_camtoworlds = get_ordered_poses(self.parser.camtoworlds)
@@ -2092,34 +2092,39 @@ class Runner:
                             ],
                             axis=1,
                         )  # [N, 4, 4]
-                        # pick one camera
-                        cam_num = np.random.randint(0, len(prune_camtoworlds))
-                        prune_camtoworlds = prune_camtoworlds[cam_num : cam_num + 1]  # [1, 4, 4]
-                        # 7) Apply dynamic scale
+                        # Choose up to K trajectory cameras (reduces randomness vs single random camera)
+                        K = min(8, len(prune_camtoworlds)) if len(prune_camtoworlds) > 0 else 0
+                        if K == 0:
+                            # nothing to do
+                            continue
+
+                        # pick K indices spaced across the path for diversity
+                        if len(prune_camtoworlds) <= K:
+                            sampled = prune_camtoworlds
+                        else:
+                            # evenly spaced selection + small random offset
+                            idxs = np.linspace(0, len(prune_camtoworlds) - 1, K, dtype=int)
+                            sampled = prune_camtoworlds[idxs]
+
+                        # 7) Apply dynamic scale to sampled cameras
                         scale_factor = 1.1 * scale_variation
-                        prune_camtoworlds = prune_camtoworlds * np.reshape(
+                        sampled = sampled * np.reshape(
                             np.array([[scale_factor, scale_factor, scale_factor, 1.0]]), (1, 4, 1)
                         )
-                        
-                        # 8) Convert to torch tensor
-                        prune_camtoworlds = torch.from_numpy(prune_camtoworlds).float().to(device)
-                        
-                        # # 9) Check distance to ALL trajectory cameras
-                        # means3d = self.splats["means3d"]  # [num_gaussians, 3]
-                        # all_cam_positions = prune_camtoworlds[:, :3, 3]  # [N_traj, 3]
-                        
-                        # Compute minimum distance to any trajectory camera
-                        # dists_to_all_cams = torch.cdist(means3d, all_cam_positions)  # [num_gaussians, N_traj]
-                        # min_dists = dists_to_all_cams.min(dim=1)[0]  # [num_gaussians]
+
+                        # 8) Convert sampled cameras to torch tensor
+                        prune_camtoworlds_t = torch.from_numpy(sampled).float().to(device)  # [K,4,4]
+
+                        # Compute minimum distance from each Gaussian to any sampled camera
                         means3d = self.splats["means3d"]  # [num_gaussians, 3]
-                        cam_position = prune_camtoworlds[0, :3, 3]  # [3]
-                        dists_to_cam = torch.norm(means3d - cam_position.unsqueeze(0), dim=1)  # [num_gaussians]
-                        min_dists = dists_to_cam  # since only one camera is used// tensor
-                        
-                        is_2close = min_dists < 0.1 * self.scene_scale  # threshold configurable
+                        cam_positions = prune_camtoworlds_t[:, :3, 3]  # [K,3]
+                        # torch.cdist returns [G, K]
+                        dists = torch.cdist(means3d, cam_positions)  # [G, K]
+                        min_dists = dists.min(dim=1)[0]
+
+                        is_2close = min_dists < (0.1 * self.scene_scale)  # threshold configurable
                         is_prune = is_prune | is_2close
-                        print(f" min dists: {min_dists} self.scene_scale: {self.scene_scale}") # 7.267
-                        print(f"  -> [Offset:{offset}, Scale:{scale_variation:.2f}] Marked {is_2close.sum().item()} Gaussians too close to trajectory cameras for pruning")
+                        print(f"  -> [Offset:{offset}, Scale:{scale_variation:.2f}] Sampled {K} cams; marked {is_2close.sum().item()} Gaussians too close to trajectory cameras for pruning")
 #-----------------------------------------------------------------------------------------------------
 #revised-1016       # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
                     # 1. Depth-based floater detection 
