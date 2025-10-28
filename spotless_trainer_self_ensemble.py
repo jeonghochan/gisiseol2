@@ -1269,7 +1269,7 @@ class Runner:
             static_ratio = w_stat / total_w
             
             # 주로 정적 영역에 나타나는 Gaussian (>80%)
-            is_background = static_ratio > 0.8
+            is_background = static_ratio > 0.6
             
             # 이 중 일부를 복제하여 동적 영역으로 확장
             bg_indices = torch.where(is_background)[0]
@@ -1353,7 +1353,6 @@ class Runner:
             # 실제로 분할된 개수 반환(보호적으로 계산)
             return int(min(n_to_copy, new_created))
         
-        return 0
 #-------------------------------------------------------------------------------------------------------------------------
 
     def train(self):
@@ -1557,15 +1556,19 @@ class Runner:
                     mask_chw = binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W], 마스크
                     render_chw_safe = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw) # 마스크 영역은 렌더링 그래디언트가 안 흐르도록 처리
 
-                # Extract tokens for GT and render. Avoid overwriting tokens under
-                # a torch.no_grad() context so that gradients can flow into the
-                # upsample head / render path if desired.
+                # Extract tokens for GT and render.
+                # Compute GT tokens under no_grad (we don't need grads w.r.t. GT),
+                # but compute render tokens without no_grad so gradients can flow
+                # back into the render path (and thus into `colors`).
                 with torch.no_grad():
                     ftok, Th, Tw, _, _ = self.dino_extractor.extract_tokens(gt_chw)
-                    if mask_adaptation and (binary_mask is not None):
-                        fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw_safe)
-                    else:
-                        fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
+
+                # Render tokens must be computed with autograd enabled so that
+                # the DINO loss can propagate into the render pipeline.
+                if mask_adaptation and (binary_mask is not None):
+                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw_safe)
+                else:
+                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
 
                 assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
                 B, _, C = ftok.shape
@@ -1712,7 +1715,6 @@ class Runner:
                 # loss definition
                 rgbloss = (binary_mask * error_per_pixel).sum() / (binary_mask.sum()*3 + 1e-8)
                 # ssim loss
-                # (Todo) it should be considered to use masked ssim or not
                 # ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
                 # do not use because it allocates a lot of memories (16GB)
                 ssimloss = 1.0 - self.masked_ssim(pixels.permute(0,3,1,2), colors.permute(0,3,1,2), binary_mask.permute(0,3,1,2)) # take all into B C H W
@@ -1745,7 +1747,7 @@ class Runner:
                 self.cfg.se_coreg_enable
                 and binary_mask is not None
                 and cfg.refine_start_iter <= step
-                and step % cfg.se_coreg_refine_every == 0
+                and step % cfg.refine_every == 0
             ):
                 # TODO: implement pseudo view selection strategy
                 # to use spotless-mlp classifier pixelwise model trained with binary mask and use that for pseudo view dynamic mask.
@@ -2105,8 +2107,9 @@ class Runner:
                         dists_to_cam = torch.norm(means3d - cam_position.unsqueeze(0), dim=1)  # [num_gaussians]
                         min_dists = dists_to_cam  # since only one camera is used
                         
-                        is_2close = min_dists < 0.02 * self.scene_scale  # threshold configurable
+                        is_2close = min_dists < 0.1 * self.scene_scale  # threshold configurable
                         is_prune = is_prune | is_2close
+                        print(f" min dists: {min_dists} self.scene_scale: {self.scene_scale}")
                         print(f"  -> [Offset:{offset}, Scale:{scale_variation:.2f}] Marked {is_2close.sum().item()} Gaussians too close to trajectory cameras for pruning")
 #-----------------------------------------------------------------------------------------------------
 #revised-1016       # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
