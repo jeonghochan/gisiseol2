@@ -2798,7 +2798,6 @@ class Runner:
                 axis=0 if width > height else 1
             )
             #-------------------------------------------------------------
-
             
             canvas_all.append(canvas)
 
