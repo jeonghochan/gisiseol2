@@ -147,7 +147,7 @@ class Config:
     # Use absolute gradient for pruning. This typically requires larger --grow_grad2d, e.g., 0.0008 or 0.0006
     absgrad: bool = False
     # Use utilization-based pruning (UBP) for compression: xection 4.2.3 https://arxiv.org/pdf/2406.20055
-    ubp: bool = False
+    ubp: bool = True
     # Threshold for UBP
     ubp_thresh: float = 1e-14
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
@@ -195,7 +195,7 @@ class Config:
     mlp_gt_lambda: float = 0.1
     # Weight for DINO feature loss
     dino_loss_flag: bool = True
-    dino_loss_lambda: float = 0.3 #tag
+    dino_loss_lambda: float = 0.2 #tag
     
 
     #parameter for self-ensemble-revised-1013
@@ -208,9 +208,10 @@ class Config:
     uap_noise_anneal_end: int = 20000      # 이 step까지 선형 점감
 
     se_coreg_enable: bool = True
+    se_coreg_start_iter: int = 7000
     se_coreg_lambda: float = 0.5            # render↔render loss 계수
     se_pseudo_K: int = 2                    # pseudo view 개수
-    se_coreg_refine_every: int = 200    # self-ensemble 
+    se_coreg_refine_every: int = 100    # self-ensemble 
     # fallback jitter (cameras.PseudoCamera 미사용시)
     se_jitter_deg: float = 1.0              # yaw/pitch/roll 표준편차(도)
     se_jitter_trans: float = 0.01           # 번역 표준편차(장면스케일 비율)
@@ -236,6 +237,10 @@ class Config:
     transient_loss_start_iter: int = 7000     # iteration부터 main loss에 transient loss 적용
     KL_threshold: float = 0.5           # KL divergence threshold for masking
     schedule_beta: float = -3e-3        # Alpha sampling schedule rate
+    #revised-1028
+    # Minimum age (in training steps) before a newly created Gaussian can be
+    # pruned. Helps avoid immediate prune after duplication/splitting.
+    min_age_before_prune: int = 3
 
   
 
@@ -538,6 +543,9 @@ class Runner:
             "sqrgrad": torch.zeros(n_gauss, device=self.device),
             "w_static": torch.zeros(n_gauss, device=self.device, dtype=torch.float), #revised-0921
             "w_dynamic": torch.zeros(n_gauss, device=self.device, dtype=torch.float),
+            # Birth step per Gaussian: used to protect newly created Gaussians from immediate pruning. # revised-1028
+            # dtype long to store training step indices.
+            "birth_steps": torch.zeros(n_gauss, device=self.device, dtype=torch.long),
         }
 
     def rasterize_splats(
@@ -1353,6 +1361,11 @@ class Runner:
             # 실제로 분할된 개수 반환(보호적으로 계산)
             return int(min(n_to_copy, new_created))
         
+        # If none of the inpainting branches ran (for example if running
+        # statistics keys are missing), ensure an integer is returned so the
+        # caller can safely compare the result (avoid NoneType > int error).
+        return 0
+
 #-------------------------------------------------------------------------------------------------------------------------
 
     def train(self):
@@ -1409,6 +1422,10 @@ class Runner:
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
+            # revised-1028    
+            # expose current training step to other methods (refine_*),
+            # so newly created Gaussians can record a birth step.
+            self.current_step = step
 
             try:
                 data = next(trainloader_iter)
@@ -1537,18 +1554,16 @@ class Runner:
             # revised
             #--------------------------------------------------------------------------------------------------------------------------------------------
             if cfg.dino_loss_flag:
-                # 0) lazy init (한 번만 만들기)
                 if not hasattr(self, "dino_extractor"):
                     self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
                 if not hasattr(self, "dino_head"):
                     # DINO 토큰(저해상도) -> 픽셀 해상도로 올리는 경량 업샘플 헤드
                     self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
-            
 
                 # self hard coded control
                 mask_adaptation = False
 
-                # 1) DINO 토큰 추출 (GT/Render)  **no no_grad()**  ← 그래디언트가 colors까지 흘러가야 함
+                # 1) DINO 토큰 추출 (GT/Render) 
                 gt_chw     = pixels.permute(0, 3, 1, 2)    # [B,3,H,W], GT
                 render_chw = colors.permute(0, 3, 1, 2)    # [B,3,H,W], 렌더 결과
 
@@ -1556,19 +1571,15 @@ class Runner:
                     mask_chw = binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W], 마스크
                     render_chw_safe = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw) # 마스크 영역은 렌더링 그래디언트가 안 흐르도록 처리
 
-                # Extract tokens for GT and render.
-                # Compute GT tokens under no_grad (we don't need grads w.r.t. GT),
-                # but compute render tokens without no_grad so gradients can flow
-                # back into the render path (and thus into `colors`).
-                with torch.no_grad():
-                    ftok, Th, Tw, _, _ = self.dino_extractor.extract_tokens(gt_chw)
+                # ftok  = self.dino_extractor.extract_tokens(gt_chw)      # [B,Th*Tw,C] (백본 파라미터는 require_grad=False로 freeze)
+                # fhtok = self.dino_extractor.extract_tokens(render_chw)  # [B,Th*Tw,C]
 
-                # Render tokens must be computed with autograd enabled so that
-                # the DINO loss can propagate into the render pipeline.
-                if mask_adaptation and (binary_mask is not None):
-                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw_safe)
-                else:
-                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
+                with torch.no_grad():  
+                    ftok,  Th, Tw, _, _  = self.dino_extractor.extract_tokens(gt_chw)
+                    if mask_adaptation and (binary_mask is not None):
+                        fhtok, Th2, Tw2, _, _  = self.dino_extractor.extract_tokens(render_chw_safe)      
+                    else:
+                        fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw) 
 
                 assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
                 B, _, C = ftok.shape
@@ -1592,16 +1603,13 @@ class Runner:
                 
                 # 3) 코사인 불일치(=의미 차이) 맵 -> 배경(inlier) 영역에서만 정합 유도
                 cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]       
-                # Compute DINO feature loss. If no mask is provided, fall back to
-                # the mean of the cosine-difference map to avoid dividing by None.
                 if mask_adaptation and (binary_mask is not None):
                     dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
                 else:
                     dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
-
-            if cfg.dino_loss_flag :
-                # print("DINO loss computation is activated.")
+                    
                 dino_loss =  dino_feat_loss
+                
             else:
                 dino_loss = 0.0
             #--------------------------------------------------------------------------------------------------------------------------------------------
@@ -1746,8 +1754,8 @@ class Runner:
             if (
                 self.cfg.se_coreg_enable
                 and binary_mask is not None
-                and cfg.refine_start_iter <= step
-                and step % cfg.refine_every == 0
+                and cfg.se_coreg_start_iter < step
+                and step % cfg.se_coreg_refine_every == 0
             ):
                 # TODO: implement pseudo view selection strategy
                 # to use spotless-mlp classifier pixelwise model trained with binary mask and use that for pseudo view dynamic mask.
@@ -1887,10 +1895,10 @@ class Runner:
                 
             #total loss            
             # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p +transient_loss_weighted * lambda_p
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda )  + se_coreg_loss * cfg.se_coreg_lambda +transient_loss_weighted * lambda_p
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda )  + (se_coreg_loss * cfg.se_coreg_lambda)* lambda_p + transient_loss_weighted * lambda_p
 # ----------------------------------------------------------------------------------------------------------------------------
 
-            loss.backward(retain_graph = True)
+            loss.backward()
 
 
             desc = f"loss={loss.item():.9f}| " f"sh degree={sh_degree_to_use}| "
@@ -2105,11 +2113,11 @@ class Runner:
                         means3d = self.splats["means3d"]  # [num_gaussians, 3]
                         cam_position = prune_camtoworlds[0, :3, 3]  # [3]
                         dists_to_cam = torch.norm(means3d - cam_position.unsqueeze(0), dim=1)  # [num_gaussians]
-                        min_dists = dists_to_cam  # since only one camera is used
+                        min_dists = dists_to_cam  # since only one camera is used// tensor
                         
                         is_2close = min_dists < 0.1 * self.scene_scale  # threshold configurable
                         is_prune = is_prune | is_2close
-                        print(f" min dists: {min_dists} self.scene_scale: {self.scene_scale}")
+                        print(f" min dists: {min_dists} self.scene_scale: {self.scene_scale}") # 7.267
                         print(f"  -> [Offset:{offset}, Scale:{scale_variation:.2f}] Marked {is_2close.sum().item()} Gaussians too close to trajectory cameras for pruning")
 #-----------------------------------------------------------------------------------------------------
 #revised-1016       # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
@@ -2138,6 +2146,19 @@ class Runner:
                     if cfg.ubp:
                         not_utilized = self.running_stats["sqrgrad"] < cfg.ubp_thresh
                         is_prune = is_prune | not_utilized
+                        #revised-1028
+                    # Protect newly created Gaussians from immediate pruning by requiring
+                    # a minimum age (in training steps) before they become eligible.
+                    if "birth_steps" in self.running_stats and getattr(cfg, "min_age_before_prune", 0) > 0:
+                        birth = self.running_stats["birth_steps"]
+                        # birth is a tensor of dtype long on the same device as running_stats
+                        age = (self.current_step - birth)
+                        eligible = age >= int(cfg.min_age_before_prune)
+                        # ensure boolean mask on same device/dtype
+                        eligible = eligible.to(is_prune.device)
+                        is_prune = is_prune & eligible
+                    #------------------------------------------------------------
+
                     n_prune = is_prune.sum().item()
                     self.refine_keep(~is_prune)
 
@@ -2381,12 +2402,27 @@ class Runner:
         for k, v in self.running_stats.items():
             if v is None or k.find("err") != -1:
                 continue
-            repeats = [2] + [1] * (v.dim() - 1)
-            v_new = v[sel].repeat(repeats)
-            if k == "sqrgrad":
-                v_new = torch.ones_like(
-                    v_new
-                )  # the new ones are assumed to have high utilization in the start
+
+            # repeats = [2] + [1] * (v.dim() - 1)
+            # v_new = v[sel].repeat(repeats)
+            # if k == "sqrgrad":
+            #     v_new = torch.ones_like(
+            #         v_new
+            #     )  # the new ones are assumed to have high utilization in the start
+
+            #revised-1028
+            # For most stats we repeat the selected entries twice (split -> 2 children)
+            if k == "birth_steps":
+                # new children get birth step == current_step
+                n_children = 2 * len(sel)
+                v_new = torch.full((n_children,), fill_value=getattr(self, "current_step", 0), device=self.device, dtype=v.dtype)
+            else:
+                repeats = [2] + [1] * (v.dim() - 1)
+                v_new = v[sel].repeat(repeats)
+                if k == "sqrgrad":
+                    # the new ones are assumed to have high utilization in the start
+                    v_new = torch.ones_like(v_new)
+            #---------------------------------------------------------------
             self.running_stats[k] = torch.cat((v[rest], v_new))
         torch.cuda.empty_cache()
 
@@ -2418,9 +2454,19 @@ class Runner:
             if k.find("err") != -1:
                 continue
             if k == "sqrgrad":
-                self.running_stats[k] = torch.cat(
-                    (v, torch.ones_like(v[sel]))
-                )  # new ones are assumed to have high utilization
+                # self.running_stats[k] = torch.cat(
+                #     (v, torch.ones_like(v[sel]))
+                # )  # new ones are assumed to have high utilization
+
+                #revised-1028
+                # new ones are assumed to have high utilization
+                self.running_stats[k] = torch.cat((v, torch.ones_like(v[sel])))
+            elif k == "birth_steps":
+                # stamp birth step for newly duplicated gaussians
+                n_new = len(sel)
+                new_births = torch.full((n_new,), fill_value=getattr(self, "current_step", 0), device=self.device, dtype=v.dtype)
+                self.running_stats[k] = torch.cat((v, new_births))
+                #---------------------------------------------------------------
             else:
                 self.running_stats[k] = torch.cat((v, v[sel]))
         torch.cuda.empty_cache()
