@@ -207,7 +207,8 @@ class Config:
     uap_noise_final: float = 0.03           # 최종 섭동 강도 (0.02 -> 0.03로 증가)
     uap_noise_anneal_end: int = 20000      # 이 step까지 선형 점감
 
-    se_coreg_enable: bool = False
+    se_coreg_enable: bool = True
+    se_coreg_start_iter: int = 7000
     se_coreg_lambda: float = 0.5            # render↔render loss 계수
     se_pseudo_K: int = 2                    # pseudo view 개수
     se_coreg_refine_every: int = 100    # self-ensemble 
@@ -1750,7 +1751,15 @@ class Runner:
 #revised-1013
             # ---------------- Self-Ensemble: pseudo-view render↔render loss ----------------
             se_coreg = torch.tensor(0.0, device=device)
-            if self.cfg.se_coreg_enable and binary_mask is not None and cfg.se_coreg_start_iter <= step and step % cfg.refine_every == 0:
+            if (
+                self.cfg.se_coreg_enable
+                and binary_mask is not None
+                and cfg.se_coreg_start_iter < step
+                and step % cfg.se_coreg_refine_every == 0
+            ):
+                # TODO: implement pseudo view selection strategy
+                # to use spotless-mlp classifier pixelwise model trained with binary mask and use that for pseudo view dynamic mask.
+
 
                 # (1) Make pseudo views (may return multiple views). Limit to two
                 # pv_c2w, pv_K = self._make_pseudo_views(camtoworlds, Ks, self.cfg.se_pseudo_K)
@@ -1885,7 +1894,8 @@ class Runner:
 
                 
             #total loss            
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p +transient_loss_weighted * lambda_p
+            # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p +transient_loss_weighted * lambda_p
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda )  + (se_coreg_loss * cfg.se_coreg_lambda)* lambda_p + transient_loss_weighted * lambda_p
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward()
@@ -2051,7 +2061,7 @@ class Runner:
                         is_prune = is_prune | is_too_big
                         
 #revised-1015-1024 ---------------------------------------------------------------------------------------------------
-# Prune Gaussians too close to trajectory cameras (매번 다른 궤적 사용)
+                    # Prune Gaussians too close to trajectory cameras (매번 다른 궤적 사용)
                     if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter and step % cfg.refine_every == 0:
                         # 1) Get ordered camera poses
                         prune_camtoworlds = get_ordered_poses(self.parser.camtoworlds)
@@ -2266,6 +2276,7 @@ class Runner:
     def update_running_stats(self, info: Dict, binary_mask: torch.Tensor, step: int):
         """Update running stats."""
         cfg = self.cfg
+        device = self.device
 
         # normalize grads to [-1, 1] screen space
         if cfg.absgrad:
@@ -2288,6 +2299,47 @@ class Runner:
                 self.running_stats["sqrgrad"].index_add_(
                     0, gs_ids, torch.sum(sqrgrads, dim=-1)
                 )
+#revised-1028-2
+            # Update static/dynamic visibility counts when using packed fragments
+            if "w_static" in self.running_stats and binary_mask is not None:
+                # Only update if the packed meta contains the detailed fragment mapping
+                if (
+                    "isect_offsets" in info
+                    and "isect_ids" in info
+                    and "flatten_ids" in info
+                    and "tile_width" in info
+                    and "tile_size" in info
+                ):
+                    
+                    isect_offsets = info["isect_offsets"].long().view(-1)
+                    isect_ids = info["isect_ids"].long().view(-1)
+                    flatten_ids = info["flatten_ids"].long().view(-1)
+                    tw = int(info["tile_width"])
+                    ts = int(info["tile_size"])
+                    th = int(info.get("tile_height", tw)) #
+                    H = int(info["height"])
+                    W = int(info["width"])
+
+                    lengths = (isect_offsets[1:] - isect_offsets[:-1]).clamp_min(0)
+                    # tile_ids = torch.repeat_interleave(torch.arange(tw * tw, device=device), lengths)
+                    tile_ids = torch.repeat_interleave(torch.arange(tw * th, device=device), lengths)
+
+                    tx = tile_ids % tw
+                    ty = tile_ids // tw
+                    lx = flatten_ids % ts
+                    ly = flatten_ids // ts
+                    x = (tx * ts + lx).clamp_max(W - 1)
+                    y = (ty * ts + ly).clamp_max(H - 1)
+                    p_lin = (y * W + x)
+
+                    dyn_flag_lin = (binary_mask[0].reshape(-1) < 0.5).float()
+                    frag_dyn = dyn_flag_lin[p_lin]
+
+                    # accumulate counts per-gaussian
+                    self.running_stats["w_dynamic"].index_add_(0, isect_ids, frag_dyn)
+                    self.running_stats["w_static"].index_add_(0, isect_ids, 1.0 - frag_dyn)
+#------------------------------------------------------------------------------------------------
+                    
 
         else:
             # grads is [C, N, 2]
@@ -2301,6 +2353,37 @@ class Runner:
                 self.running_stats["sqrgrad"].index_add_(
                     0, gs_ids, torch.sum(sqrgrads[sel], dim=-1)
                 )
+
+            # Update static/dynamic visibility counts for unpacked info (means2d/radii)
+            if "w_static" in self.running_stats and binary_mask is not None:
+                try:
+                    means2d = info.get("means2d", None)
+                    radii = info.get("radii", None)
+                    H = int(info["height"]); W = int(info["width"])
+                    if means2d is not None:
+                        if means2d.dim() == 3 and means2d.shape[0] > 0:
+                            m2d = means2d[0]
+                            rpx = radii[0] if radii is not None else torch.zeros(m2d.shape[0], device=device)
+                        else:
+                            m2d = means2d
+                            rpx = radii if radii is not None else torch.zeros(m2d.shape[0], device=device)
+
+                        mx = (m2d[:, 0] * 0.5 + 0.5) * (W - 1)
+                        my = (m2d[:, 1] * 0.5 + 0.5) * (H - 1)
+                        mu_px = torch.stack([mx, my], dim=-1)
+
+                        vis = (rpx > 0.0)
+                        idxs = torch.where(vis)[0]
+                        if idxs.numel() > 0:
+                            xs = mu_px[idxs, 0].round().clamp(0, W - 1).long()
+                            ys = mu_px[idxs, 1].round().clamp(0, H - 1).long()
+                            dyn = (binary_mask[0] < 0.5)
+                            frag_dyn = dyn[ys, xs].float()
+                            self.running_stats["w_dynamic"].index_add_(0, idxs, frag_dyn)
+                            self.running_stats["w_static"].index_add_(0, idxs, 1.0 - frag_dyn)
+                except Exception:
+                    # best-effort: if something unexpected happens, skip
+                    pass
 
 
     @torch.no_grad()
@@ -2792,6 +2875,7 @@ class Runner:
                 axis=0 if width > height else 1
             )
             #-------------------------------------------------------------
+
             
             canvas_all.append(canvas)
 
