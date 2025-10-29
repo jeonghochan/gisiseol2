@@ -2927,7 +2927,6 @@ def main(cfg: Config):
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(10)
 
-
 if __name__ == "__main__":
     cfg = tyro.cli(Config)
     cfg.adjust_steps(cfg.steps_scaler)
