@@ -207,8 +207,10 @@ class Config:
     uap_noise_final: float = 0.03           # 최종 섭동 강도 (0.02 -> 0.03로 증가)
     uap_noise_anneal_end: int = 20000      # 이 step까지 선형 점감
 
-    se_coreg_enable: bool = False
-    se_coreg_lambda: float = 0.5            # render↔render loss 계수
+
+    se_coreg_enable: bool = True
+    se_coreg_start_iter: int = 7000
+    se_coreg_lambda: float = 0.1 #0.5            # render↔render loss 계수
     se_pseudo_K: int = 2                    # pseudo view 개수
     se_coreg_refine_every: int = 100    # self-ensemble 
     # fallback jitter (cameras.PseudoCamera 미사용시)
@@ -1750,7 +1752,16 @@ class Runner:
 #revised-1013
             # ---------------- Self-Ensemble: pseudo-view render↔render loss ----------------
             se_coreg = torch.tensor(0.0, device=device)
-            if self.cfg.se_coreg_enable and binary_mask is not None and cfg.se_coreg_start_iter <= step and step % cfg.refine_every == 0:
+            if (
+                self.cfg.se_coreg_enable
+                and binary_mask is not None
+                # and cfg.se_coreg_start_iter < step
+                and cfg.refine_start_iter < step
+                and step % cfg.se_coreg_refine_every == 0
+            ):
+                # TODO: implement pseudo view selection strategy
+                # to use spotless-mlp classifier pixelwise model trained with binary mask and use that for pseudo view dynamic mask.
+
 
                 # (1) Make pseudo views (may return multiple views). Limit to two
                 # pv_c2w, pv_K = self._make_pseudo_views(camtoworlds, Ks, self.cfg.se_pseudo_K)
@@ -1884,8 +1895,9 @@ class Runner:
             # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + (transient_loss * lambda_p)  
 
                 
-            #total loss            
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + se_coreg_loss * lambda_p +transient_loss_weighted * lambda_p
+            # total loss            
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) + se_coreg_loss *cfg.se_coreg_lambda + transient_loss_weighted * lambda_p
+            # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda )  + (se_coreg_loss * cfg.se_coreg_lambda)* lambda_p + transient_loss_weighted * lambda_p
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward()
