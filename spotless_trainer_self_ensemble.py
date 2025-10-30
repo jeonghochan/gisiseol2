@@ -241,7 +241,7 @@ class Config:
     #revised-1028
     # Minimum age (in training steps) before a newly created Gaussian can be
     # pruned. Helps avoid immediate prune after duplication/splitting.
-    min_age_before_prune: int = 100
+    min_age_before_prune: int = 150
 
   
 
