@@ -228,7 +228,7 @@ class Config:
     depth_floater_thresh: float = 0.005                # Depth inconsistency threshold
     # Ghost/Transparency Artifact Fix
     #-----------------for handling under-reconstructed dynamic regions---
-    dynamic_prune_start_iter: int = 15000          # When to start aggressive pruning
+    dynamic_prune_start_iter: int = 15000            # When to start aggressive pruning
     enable_dynamic_inpainting: bool = True          # Fill dynamic regions with nearby background Gaussians
     #--------------------------------------------------------------
     #revised-1017
@@ -946,66 +946,6 @@ class Runner:
         finally:
             self.splats = orig
 
-
-    @torch.no_grad()
-    def _find_reset_gaussians_by_mask(self, dyn_mask_bhw: torch.Tensor, info: dict) -> torch.Tensor:
-        """
-        동적 마스크(=0)와의 '실제 splat 픽셀' 겹침 비율로 섭동 대상 선택.
-        meta(info)가 packed이고 다음 키들을 제공한다고 가정:
-          - 'gaussian_ids' [nnz] : 로컬→전역 인덱스 매핑
-          - 'means2d'    [nnz,2] : 2D 중심 (픽셀 or [-1,1] → 아래서 자동 판별)
-          - 'conics'     [nnz,2,2] (precision) 또는 제공 안되면 'radii' [nnz]
-          - 'tile_width','tile_height','tile_size','isect_offsets'[T+1],'isect_ids'[*]
-        반환: [N] boolean mask (전역 인덱스 공간)
-        """
-        dev = dyn_mask_bhw.device
-        N   = len(self.splats["means3d"])
-        H   = int(info["height"]); W = int(info["width"])
-        tw  = int(info["tile_width"])
-        th = int(info["tile_height"])
-        ts = int(info["tile_size"])
-        #fragment: gaussian-tile 겹침 단위/(가우시안 id, 픽셀 id) 쌍들의 리스트
-        #packed: fragment 단위로 정렬/저장 (타일별 fragment 개수 불균일 → fragment별로 속한 타일 id 필요)
-        #→ fragment별로 타일 id, 타일 내 픽셀좌표 복원 필요
-
-        ids_full      = info["gaussian_ids"].long().view(-1)   # [nnz] (local→global)
-        isect_offsets = info["isect_offsets"].long().view(-1)  # [T+1], T=tw*th
-        isect_ids     = info["isect_ids"].long().view(-1)      # [M]   (local gaussian per fragment)
-        flatten_ids   = info["flatten_ids"].long().view(-1)    # [M]   (tile-local pixel offset per fragment)
-
-        nnz = ids_full.numel()
-        if nnz == 0 or isect_ids.numel() == 0:
-            return torch.zeros(N, dtype=torch.bool, device=dev)
-
-        # offsets → 각 fragment가 속한 타일 id 벡터 (벡터화)
-        lengths  = (isect_offsets[1:] - isect_offsets[:-1]).clamp_min(0)  # [T]
-        tile_ids = torch.repeat_interleave(torch.arange(tw*th, device=dev), lengths)  # [M]
-
-        # 타일 좌표(tx,ty)와 tile-local offset(lx,ly)로부터 전역 픽셀좌표 복원
-        tx = tile_ids % tw
-        ty = tile_ids // tw
-        lx =  flatten_ids % ts
-        ly =  flatten_ids // ts
-        x  = (tx * ts + lx).clamp_max(W-1)
-        y  = (ty * ts + ly).clamp_max(H-1)
-        p_lin = (y * W + x)  # [M]
-
-        # 동적(=0) 플래그를 선형으로 → fragment별 동적 여부로 인덱싱
-        dyn_flag_lin = (dyn_mask_bhw[0].reshape(-1) < 0.5).to(torch.int32)  # [H*W]
-        frag_dyn     = dyn_flag_lin[p_lin]                                   # [M] {0,1}
-
-        # per-local-gaussian 카운트 (길이 nnz)
-        dyn_counts   = torch.bincount(isect_ids, weights=frag_dyn.float(), minlength=nnz)  # [nnz]
-        cover_counts = torch.bincount(isect_ids, minlength=nnz).float().clamp_min(1.0)     # [nnz]
-        frac_local   = dyn_counts / cover_counts                                           # [nnz]
-        sel_local    = (frac_local >= self.cfg.uap_dyn_overlap_frac)                       # [nnz]
-
-        # packed → 전역 인덱스로 승격
-        reset_mask = torch.zeros(N, dtype=torch.bool, device=dev)
-        reset_mask[ids_full[sel_local]] = True
-        print("reset gaussians by maks works")
-        return reset_mask
-
     @torch.no_grad()
     def _find_reset_gaussians_by_mask(self, dyn_mask_bhw: torch.Tensor, info: dict) -> torch.Tensor:
         """
@@ -1122,6 +1062,7 @@ class Runner:
             self.splats["opacities"].data = torch.logit(alpha)
 #revised-1016-------------------------------------------------------------------------------------------
     @torch.no_grad()
+    #not used
     def _detect_depth_inconsistent_gaussians(
         self, camtoworlds: Tensor, Ks: Tensor, width: int, height: int, 
         dyn_mask: Tensor, depth_threshold: float = 0.5
@@ -1202,7 +1143,8 @@ class Runner:
             gauss_depth_normalized = (gauss_depth - gauss_depth.min()) / (gauss_depth.max() - gauss_depth.min() + 1e-6)
             
             # 동적 마스크 영역에 주로 나타나면서 주변 배경보다 앞에 있는 Gaussian 감지
-            if hasattr(self.running_stats, 'w_dynamic') and hasattr(self.running_stats, 'w_static'):
+            # running_stats is a dict; use key membership checks instead of hasattr
+            if isinstance(self.running_stats, dict) and "w_dynamic" in self.running_stats and "w_static" in self.running_stats:
                 w_dyn = self.running_stats["w_dynamic"]
                 w_stat = self.running_stats["w_static"]
                 total_w = w_dyn + w_stat + 1e-6
@@ -1219,7 +1161,7 @@ class Runner:
 
     @torch.no_grad()
     def _inpaint_dynamic_regions(
-        self, binary_mask: torch.Tensor, camtoworlds: Tensor, inpaint_strength: float
+        self, binary_mask: torch.Tensor, camtoworlds: Tensor, inpaint_strength: float, info: Optional[dict] = None
     ) -> int:
         """
         동적 영역의 "구멍"을 주변 배경 Gaussian으로 채우기 (inpainting)
@@ -1257,6 +1199,7 @@ class Runner:
         # 경계 영역 (동적 영역 주변)
         border_region = (dyn_dilated > 0.5) & (dyn_eroded < 0.5)
         
+        
         # 카메라 위치
         cam_pos = camtoworlds[0, :3, 3]  # [3]
         means3d = self.splats["means3d"]  # [N, 3]
@@ -1267,28 +1210,32 @@ class Runner:
         # 경계 영역의 중심 계산 (world space)
         border_pixels = torch.where(border_region)
         if len(border_pixels[0]) == 0:
+            print("no border region found for inpainting")
             return 0
         
         # 정적 영역의 Gaussian 중 경계 근처에 있는 것 찾기
-        if hasattr(self.running_stats, 'w_static') and hasattr(self.running_stats, 'w_dynamic'):
+        # running_stats is a dict; use key membership checks instead of hasattr
+        if isinstance(self.running_stats, dict) and "w_static" in self.running_stats and "w_dynamic" in self.running_stats:
+            print("inpaint dynamic region works")
             w_stat = self.running_stats["w_static"]
             w_dyn = self.running_stats["w_dynamic"]
             total_w = w_stat + w_dyn + 1e-6
             static_ratio = w_stat / total_w
             
             # 주로 정적 영역에 나타나는 Gaussian (>80%)
-            is_background = static_ratio > 0.6
-            
+            is_background = static_ratio > 0.8
             # 이 중 일부를 복제하여 동적 영역으로 확장
             bg_indices = torch.where(is_background)[0]
             if bg_indices.numel() == 0:
+                print("  -> No background Gaussians found.")
                 return 0
             
             # 무작위로 일부 선택
             n_to_copy = int(bg_indices.numel() * inpaint_strength)
             if n_to_copy == 0:
+                print("  -> No background Gaussians to copy.")
                 return 0
-            
+        
             perm = torch.randperm(bg_indices.numel(), device=device)
             to_copy = bg_indices[perm[:n_to_copy]]
             
@@ -1303,6 +1250,7 @@ class Runner:
             N_after = len(self.splats["means3d"])  # 업데이트된 길이
             new_created = N_after - N_before
             if new_created <= 0:
+                print("  -> No Gaussians created.")
                 return 0
             # 일반적으로 refine_duplicate는 선택된 각 항목을 1개씩 복제한다고 가정
             new_indices = torch.arange(N_after - new_created, N_after, device=device)
@@ -1505,7 +1453,7 @@ class Runner:
                 height=height,
                 sh_degree=sh_degree_to_use,
                 near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
+                far_plane=cfg.far_plane,   
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
             )
@@ -2135,17 +2083,7 @@ class Runner:
                         #     is_prune = is_prune | (is_2close & depth_floaters)
                         #     print(f"  -> Marked {depth_floaters.sum().item()} depth-inconsistent floaters")
                     
-                    
-                    # 2. Inpaint dynamic regions (후기에만, pruning 후)
-                    if (cfg.enable_dynamic_inpainting and step >= cfg.dynamic_prune_start_iter):
-                        if step % cfg.refine_every == 0:
-                            print("[Ghost Fix] Inpainting dynamic regions...")
-                            n_inpainted = self._inpaint_dynamic_regions(
-                                binary_mask, camtoworlds, inpaint_strength=1.0
-                            )
-                            if n_inpainted > 0:
-                                print(f"  -> Inpainted {n_inpainted} background Gaussians into dynamic regions")
-                    # ====================================================
+                
 #-----------------------------------------------------------------------------------------------------------
                     
                     if cfg.ubp:
@@ -2155,6 +2093,7 @@ class Runner:
                     # Protect newly created Gaussians from immediate pruning by requiring
                     # a minimum age (in training steps) before they become eligible.
                     if "birth_steps" in self.running_stats and getattr(cfg, "min_age_before_prune", 0) > 0:
+                        # print("  -> Applying minimum age before prune constraint.")
                         birth = self.running_stats["birth_steps"]
                         # birth is a tensor of dtype long on the same device as running_stats
                         age = (self.current_step - birth)
@@ -2163,6 +2102,7 @@ class Runner:
                         eligible = eligible.to(is_prune.device)
                         is_prune = is_prune & eligible
                     #------------------------------------------------------------
+                    # ====================================================
 
                     n_prune = is_prune.sum().item()
                     self.refine_keep(~is_prune)
@@ -2171,7 +2111,20 @@ class Runner:
                         f"Step {step}: {n_prune} GSs pruned. "
                         f"Now having {len(self.splats['means3d'])} GSs."
                     )
-
+# revised-1016----------------------------------------------------------------------------------------------
+                    # Inpaint dynamic regions (후기에만, pruning 후)
+                    if (cfg.enable_dynamic_inpainting and step >= cfg.dynamic_prune_start_iter):
+                        if step % cfg.refine_every == 0:
+                            print("[Ghost Fix] Inpainting dynamic regions...")
+                            n_inpainted = self._inpaint_dynamic_regions(
+                                binary_mask, camtoworlds, inpaint_strength=1.0, info=info
+                            )
+                            if n_inpainted > 0:
+                                print(f"  -> Inpainted {n_inpainted} background Gaussians into dynamic regions")
+                            if n_inpainted == 0:
+                                print("  -> No Gaussians inpainted.")
+#---------------------------------------------------------------------------------------------------------
+                    
                     # reset running stats
                     self.running_stats["grad2d"].zero_()
                     if cfg.ubp:
@@ -2302,6 +2255,7 @@ class Runner:
 #revised-1028-2
             # Update static/dynamic visibility counts when using packed fragments
             if "w_static" in self.running_stats and binary_mask is not None:
+                print(" [DEBUG] Updating dynamic/static visibility counts from packed fragments...")  
                 # Only update if the packed meta contains the detailed fragment mapping
                 if (
                     "isect_offsets" in info
@@ -2333,7 +2287,10 @@ class Runner:
                     p_lin = (y * W + x)
 
                     dyn_flag_lin = (binary_mask[0].reshape(-1) < 0.5).float()
-                    frag_dyn = dyn_flag_lin[p_lin]
+                    # sample fragment-level dynamic flag and ensure 1D float
+                    frag_dyn = dyn_flag_lin[p_lin].view(-1)
+                    # ensure isect_ids are long and on the correct device
+                    isect_ids = isect_ids.long().to(device)
 
                     # accumulate counts per-gaussian
                     self.running_stats["w_dynamic"].index_add_(0, isect_ids, frag_dyn)
@@ -2345,6 +2302,8 @@ class Runner:
             # grads is [C, N, 2]
             sel = info["radii"] > 0.0  # [C, N]
             gs_ids = torch.where(sel)[1]  # [nnz]
+
+
             self.running_stats["grad2d"].index_add_(0, gs_ids, grads[sel].norm(dim=-1))
             self.running_stats["count"].index_add_(
                 0, gs_ids, torch.ones_like(gs_ids).float()
@@ -2355,35 +2314,84 @@ class Runner:
                 )
 
             # Update static/dynamic visibility counts for unpacked info (means2d/radii)
+            #revised-1028-2
             if "w_static" in self.running_stats and binary_mask is not None:
-                try:
-                    means2d = info.get("means2d", None)
-                    radii = info.get("radii", None)
-                    H = int(info["height"]); W = int(info["width"])
-                    if means2d is not None:
-                        if means2d.dim() == 3 and means2d.shape[0] > 0:
-                            m2d = means2d[0]
-                            rpx = radii[0] if radii is not None else torch.zeros(m2d.shape[0], device=device)
+                # print(" [DEBUG] Updating dynamic/static visibility counts from unpacked fragments...") 
+                # try:
+                means2d = info.get("means2d", None)
+                radii = info.get("radii", None)
+                H = int(info["height"]); W = int(info["width"])
+                if means2d is not None:
+                    # Normalize means2d to a per-gaussian [N,2] array (take first camera if batched)
+                    if means2d.dim() == 3 and means2d.shape[0] > 0:
+                        m2d = means2d[0]
+                    else:
+                        m2d = means2d
+
+                    N = m2d.shape[0]
+
+                    # Build per-gaussian pixel radii rpx in a robust way.
+                    if radii is None:
+                        rpx = torch.zeros(N, device=device)
+                    else:
+                        # radii may be [C, N], [N], or a packed [nnz] fragment vector.
+                        if radii.dim() == 2:
+                            # take first camera channel if present
+                            rpx = radii[0]
+                        elif radii.dim() == 1:
+                            if radii.numel() == N:
+                                # already per-gaussian
+                                rpx = radii
+                            else:
+                                # radii appears to be per-fragment; try to aggregate using gaussian_ids
+                                gid = info.get("gaussian_ids", None)
+                                if gid is not None and gid.numel() == radii.numel():
+                                    # aggregate fragment radii to per-gaussian mean
+                                    per = torch.zeros(N, device=device)
+                                    counts = torch.zeros(N, device=device)
+                                    gids = gid.long().view(-1)
+                                    vals = radii.view(-1)
+                                    # only accumulate valid indices
+                                    mask_valid = (gids >= 0) & (gids < N)
+                                    if mask_valid.any():
+                                        gids_v = gids[mask_valid]
+                                        vals_v = vals[mask_valid]
+                                        per.index_add_(0, gids_v, vals_v)
+                                        counts.index_add_(0, gids_v, torch.ones_like(gids_v, dtype=per.dtype))
+                                        counts = counts.clamp_min(1.0)
+                                        rpx = per / counts
+                                    else:
+                                        rpx = torch.zeros(N, device=device)
+                                else:
+                                    # fallback: estimate using world-space scales
+                                    if "scales" in self.splats:
+                                        rpx = torch.exp(self.splats["scales"]).max(dim=-1).values.clone().to(device)
+                                    else:
+                                        rpx = torch.zeros(N, device=device)
                         else:
-                            m2d = means2d
-                            rpx = radii if radii is not None else torch.zeros(m2d.shape[0], device=device)
+                            # unexpected shape
+                            rpx = torch.zeros(N, device=device)
 
-                        mx = (m2d[:, 0] * 0.5 + 0.5) * (W - 1)
-                        my = (m2d[:, 1] * 0.5 + 0.5) * (H - 1)
-                        mu_px = torch.stack([mx, my], dim=-1)
+                    mx = (m2d[:, 0] * 0.5 + 0.5) * (W - 1)
+                    my = (m2d[:, 1] * 0.5 + 0.5) * (H - 1)
+                    mu_px = torch.stack([mx, my], dim=-1)
 
-                        vis = (rpx > 0.0)
-                        idxs = torch.where(vis)[0]
-                        if idxs.numel() > 0:
-                            xs = mu_px[idxs, 0].round().clamp(0, W - 1).long()
-                            ys = mu_px[idxs, 1].round().clamp(0, H - 1).long()
-                            dyn = (binary_mask[0] < 0.5)
-                            frag_dyn = dyn[ys, xs].float()
-                            self.running_stats["w_dynamic"].index_add_(0, idxs, frag_dyn)
-                            self.running_stats["w_static"].index_add_(0, idxs, 1.0 - frag_dyn)
-                except Exception:
-                    # best-effort: if something unexpected happens, skip
-                    pass
+                    vis = (rpx > 0.0)
+                    idxs = torch.where(vis)[0]
+                    if idxs.numel() > 0:
+                        xs = mu_px[idxs, 0].round().clamp(0, W - 1).long()
+                        ys = mu_px[idxs, 1].round().clamp(0, H - 1).long()
+                        dyn = (binary_mask[0] < 0.5)
+                        # dyn[ys, xs] can have a trailing channel dim (e.g. [K,1]); flatten to 1D
+                        frag_dyn = dyn[ys, xs].float().view(-1)
+                        # ensure idxs is 1D long on the same device
+                        idxs = idxs.long().to(device)
+                        self.running_stats["w_dynamic"].index_add_(0, idxs, frag_dyn)
+                        self.running_stats["w_static"].index_add_(0, idxs, 1.0 - frag_dyn)
+                # except Exception:
+                #     # best-effort: if something unexpected happens, skip
+                #     print("뭐가 문제지... running stats dynamic/static visibility 업데이트 중 에러 발생, 건너뜀")
+                #     pass
 
 
     @torch.no_grad()
