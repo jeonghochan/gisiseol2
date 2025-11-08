@@ -132,7 +132,7 @@ class Config:
 
     # Start refining GSs after this iteration
     # Stop refining GSs after this iteration
-    refine_start_iter: int = 500
+    refine_start_iter: int = 100
     refine_stop_iter: int = 20000 # tag
     # Reset opacities every this steps
     reset_every: int = 300000
@@ -948,137 +948,128 @@ class Runner:
             self.splats = orig
 
 
+    
+    # gpt made function
     @torch.no_grad()
-    def _find_reset_gaussians_by_mask(self, dyn_mask_bhw: torch.Tensor, info: dict) -> torch.Tensor:
-        """
-        동적 마스크(=0)와의 '실제 splat 픽셀' 겹침 비율로 섭동 대상 선택.
-        meta(info)가 packed이고 다음 키들을 제공한다고 가정:
-          - 'gaussian_ids' [nnz] : 로컬→전역 인덱스 매핑
-          - 'means2d'    [nnz,2] : 2D 중심 (픽셀 or [-1,1] → 아래서 자동 판별)
-          - 'conics'     [nnz,2,2] (precision) 또는 제공 안되면 'radii' [nnz]
-          - 'tile_width','tile_height','tile_size','isect_offsets'[T+1],'isect_ids'[*]
-        반환: [N] boolean mask (전역 인덱스 공간)
-        """
+    def _find_reset_gaussians_by_mask(
+        self,
+        dyn_mask_bhw: torch.Tensor,  # [B,1,H,W] or [1,H,W]
+        info: dict,
+        cameras=None,                # list[int] or tensor of indices/extrinsics
+        overlap_thresh: float = None,
+    ) -> torch.Tensor:
         dev = dyn_mask_bhw.device
-        N   = len(self.splats["means3d"])
-        H   = int(info["height"]); W = int(info["width"])
-        tw  = int(info["tile_width"])
-        th = int(info["tile_height"])
-        ts = int(info["tile_size"])
-        #fragment: gaussian-tile 겹침 단위/(가우시안 id, 픽셀 id) 쌍들의 리스트
-        #packed: fragment 단위로 정렬/저장 (타일별 fragment 개수 불균일 → fragment별로 속한 타일 id 필요)
-        #→ fragment별로 타일 id, 타일 내 픽셀좌표 복원 필요
+        if overlap_thresh is None:
+            overlap_thresh = getattr(self.cfg, "uap_dyn_overlap_frac", 0.15)
 
-        ids_full      = info["gaussian_ids"].long().view(-1)   # [nnz] (local→global)
-        isect_offsets = info["isect_offsets"].long().view(-1)  # [T+1], T=tw*th
-        isect_ids     = info["isect_ids"].long().view(-1)      # [M]   (local gaussian per fragment)
-        flatten_ids   = info["flatten_ids"].long().view(-1)    # [M]   (tile-local pixel offset per fragment)
-
-        nnz = ids_full.numel()
-        if nnz == 0 or isect_ids.numel() == 0:
-            return torch.zeros(N, dtype=torch.bool, device=dev)
-
-        # offsets → 각 fragment가 속한 타일 id 벡터 (벡터화)
-        lengths  = (isect_offsets[1:] - isect_offsets[:-1]).clamp_min(0)  # [T]
-        tile_ids = torch.repeat_interleave(torch.arange(tw*th, device=dev), lengths)  # [M]
-
-        # 타일 좌표(tx,ty)와 tile-local offset(lx,ly)로부터 전역 픽셀좌표 복원
-        tx = tile_ids % tw
-        ty = tile_ids // tw
-        lx =  flatten_ids % ts
-        ly =  flatten_ids // ts
-        x  = (tx * ts + lx).clamp_max(W-1)
-        y  = (ty * ts + ly).clamp_max(H-1)
-        p_lin = (y * W + x)  # [M]
-
-        # 동적(=0) 플래그를 선형으로 → fragment별 동적 여부로 인덱싱
-        dyn_flag_lin = (dyn_mask_bhw[0].reshape(-1) < 0.5).to(torch.int32)  # [H*W]
-        frag_dyn     = dyn_flag_lin[p_lin]                                   # [M] {0,1}
-
-        # per-local-gaussian 카운트 (길이 nnz)
-        dyn_counts   = torch.bincount(isect_ids, weights=frag_dyn.float(), minlength=nnz)  # [nnz]
-        cover_counts = torch.bincount(isect_ids, minlength=nnz).float().clamp_min(1.0)     # [nnz]
-        frac_local   = dyn_counts / cover_counts                                           # [nnz]
-        sel_local    = (frac_local >= self.cfg.uap_dyn_overlap_frac)                       # [nnz]
-
-        # packed → 전역 인덱스로 승격
+        N = len(self.splats["means3d"])
         reset_mask = torch.zeros(N, dtype=torch.bool, device=dev)
-        reset_mask[ids_full[sel_local]] = True
-        print("reset gaussians by maks works")
-        return reset_mask
 
-    @torch.no_grad()
-    def _find_reset_gaussians_by_mask(self, dyn_mask_bhw: torch.Tensor, info: dict) -> torch.Tensor:
-        """
-        unpacked 메타용: means2d/radii만으로 가시 가우시안의 2D 원판(반경=radii+margin) 커버를 근사,
-        동적 마스크(=0)와의 겹침 비율이 임계 이상인 가우시안을 선택.
-        dyn_mask_bhw: [1,H,W] (1=static, 0=dynamic)
-        return: [N] boolean mask (전역 인덱스)
-        """
-        dev = dyn_mask_bhw.device
-        H = int(info["height"]); W = int(info["width"])
-        means2d = info["means2d"]           # [C,N,2] in [-1,1]
-        radii   = info.get("radii", None)   # [C,N]   in px
-        if means2d is None or radii is None:
-            # 안전장치: 필요한 키가 없으면 아무 것도 선택하지 않음
-            N = len(self.splats["means3d"])
-            return torch.zeros(N, dtype=torch.bool, device=dev)
+        # ---- unpack packed outputs ----
+        gaussian_ids = info.get("gaussian_ids", None)      # [nnz]
+        means2d     = info.get("means2d", None)            # [nnz,2]
+        camera_ids  = info.get("camera_ids", None)         # [nnz] (optional)
+        H = int(info.get("height",  dyn_mask_bhw.shape[-2]))
+        W = int(info.get("width",   dyn_mask_bhw.shape[-1]))
 
-        # 데이터 형식 확인 및 처리
-        if means2d.dim() == 3:  # [C,N,2] 형식
-            if means2d.shape[0] > 0:
-                m2d = means2d[0]          # [N,2] in [-1,1]
-                rpx = radii[0]            # [N]
+        # ---- normalize dyn mask to [B,1,H,W] & build dynamic=1 ----
+        if dyn_mask_bhw.dim() == 3:
+            dyn_mask_bhw = dyn_mask_bhw.unsqueeze(0)  # [1,1,H,W] or [1,H,W] -> [1,1,H,W]
+        if dyn_mask_bhw.shape[1] != 1:                # [B,H,W] -> [B,1,H,W]
+            dyn_mask_bhw = dyn_mask_bhw.unsqueeze(1)
+        # binary: 1=static, 0=dynamic  -> dynamic=1
+        dyn_mask = (dyn_mask_bhw < 0.5).float()       # [B,1,H,W]
+        B = dyn_mask.shape[0]
+
+        # ---- quick sanity prints ----
+        print(f"[SE-COREG DEBUG] packed nnz={None if gaussian_ids is None else int(gaussian_ids.numel())}, "
+            f"HxW={H}x{W}, B={B}, overlap_thresh={overlap_thresh}")
+
+        if (gaussian_ids is None) or (means2d is None) or (gaussian_ids.numel() == 0):
+            print("[SE-COREG WARN] missing packed fields → skip reset")
+            return reset_mask
+
+        # ---- CAMERA FILTERING ----
+        # Determine which camera indices we should keep for this call
+        # 1) if 'cameras' provided as indices: use them
+        # 2) else if B==1 and camera_ids present: keep dominant cam (mode)
+        # 3) else: keep all
+        keep_mask = torch.ones_like(gaussian_ids, dtype=torch.bool)
+        if camera_ids is not None:
+            if cameras is not None:
+                if torch.is_tensor(cameras) and cameras.dtype in (torch.int32, torch.int64):
+                    cam_set = set(cameras.view(-1).tolist())
+                elif isinstance(cameras, (list, tuple)) and len(cameras) > 0 and isinstance(cameras[0], int):
+                    cam_set = set(cameras)
+                else:
+                    # cameras might be extrinsics; fallback to "current batch views"
+                    cam_set = set()
             else:
-                N = len(self.splats["means3d"])
-                return torch.zeros(N, dtype=torch.bool, device=dev)
-        else:  # [N,2] 형식 (이미 첫 번째 카메라)
-            m2d = means2d
-            rpx = radii
-        
-        N = m2d.shape[0]
+                cam_set = set()
 
-        # [-1,1] → pixel 좌표
-        mx = (m2d[:, 0] * 0.5 + 0.5) * (W - 1)
-        my = (m2d[:, 1] * 0.5 + 0.5) * (H - 1)
-        mu_px = torch.stack([mx, my], dim=-1)  # [N,2]
-        # 가시 가우시안 (반경>0)
-        vis = (rpx > 0.0)
-        idxs = torch.where(vis)[0]
-        if idxs.numel() == 0:
-            return torch.zeros(N, dtype=torch.bool, device=dev)
+            if len(cam_set) > 0:
+                keep_mask = torch.isin(camera_ids, torch.tensor(sorted(cam_set), device=dev))
+            elif B == 1:
+                # choose dominant camera in fragments as the "current view"
+                # (this matches single-view mask most of the time)
+                uniq, counts = torch.unique(camera_ids, return_counts=True)
+                dominant = uniq[torch.argmax(counts)].item()
+                keep_mask = (camera_ids == dominant)
+                print(f"[SE-COREG DEBUG] dominant_camera={dominant} (kept {int(keep_mask.sum())} frags)")
+            else:
+                print("[SE-COREG DEBUG] multi-view batch without 'cameras' indices: keeping all fragments")
 
-        dyn = (dyn_mask_bhw[0] < 0.5)  # [H,W] True=dynamic
-        reset_mask = torch.zeros(N, dtype=torch.bool, device=dev)
-        margin = float(getattr(self.cfg, "uap_radius_px", 0.0))
+        # filter packed arrays
+        gid_kept = gaussian_ids[keep_mask]                 # [nnz_kept]
+        m2d_kept = means2d[keep_mask]                      # [nnz_kept, 2]
+        nnz_kept = int(gid_kept.numel())
+        if nnz_kept == 0:
+            print("[SE-COREG DEBUG] no fragments kept after camera filter")
+            return reset_mask
 
-        # 각 가시 가우시안에 대해: 원판 커버 픽셀 근사 → 겹침 비율
-        for gi in idxs.tolist():
-            cx = float(mu_px[gi, 0].item())
-            cy = float(mu_px[gi, 1].item())
-            r  = float(rpx[gi].item() + margin)
-            if r <= 0.5:
-                continue
-            x0 = max(0, int(cx - r)); x1 = min(W, int(cx + r) + 1)
-            y0 = max(0, int(cy - r)); y1 = min(H, int(cy + r) + 1)
-            if x1 <= x0 or y1 <= y0:
-                continue
-            # bbox 내 픽셀 그리드에서 원판 판정
-            yy, xx = torch.meshgrid(torch.arange(y0, y1, device=dev),
-                                    torch.arange(x0, x1, device=dev),
-                                    indexing="ij")
-            dx = xx.float() - cx
-            dy = yy.float() - cy
-            inside = (dx*dx + dy*dy) <= (r*r)            # [h,w] bool
-            cover  = inside.sum().item()
-            if cover == 0:
-                continue
-            dyn_overlap = (inside & dyn[y0:y1, x0:x1]).sum().item()
-            frac = dyn_overlap / float(cover)
-            if frac >= self.cfg.uap_dyn_overlap_frac:
-                reset_mask[gi] = True
-        # print("find reset gaussans by mask func are working")
+        # ---- COORDINATE SYSTEM HEURISTIC ----
+        # auto-detect whether means2d are normalized or pixel
+        mabs = m2d_kept.abs().max().item()
+        if mabs <= 2.5:
+            # assume [-1,1] normalized
+            xs = (m2d_kept[:, 0] * 0.5 + 0.5) * (W - 1)
+            ys = (m2d_kept[:, 1] * 0.5 + 0.5) * (H - 1)
+            coord_mode = "norm"
+        else:
+            # assume already pixel coordinates
+            xs = m2d_kept[:, 0]
+            ys = m2d_kept[:, 1]
+            coord_mode = "pixel"
+
+        # clamp & integer sample
+        xi = xs.clamp(0, W - 1).round().long()
+        yi = ys.clamp(0, H - 1).round().long()
+
+        # ---- pick correct mask view ----
+        # If we selected dominant camera (B==1), use mask[0]; else best-effort use mask[0]
+        dyn_view = dyn_mask[0, 0]  # [H,W]
+        dyn_vals = dyn_view[yi, xi].float()  # [nnz_kept], 1 if dynamic region, else 0
+
+        # ---- aggregate per Gaussian ----
+        total_counts = torch.bincount(gid_kept, minlength=N).float()
+        dyn_counts   = torch.bincount(gid_kept, weights=dyn_vals, minlength=N).float()
+        frac = dyn_counts / (total_counts + 1e-6)
+        over = frac > overlap_thresh
+        reset_mask |= over
+
+        # ---- DEBUG STATS ----
+        touched = (total_counts > 0).sum().item()
+        dyn_frag_ratio = (dyn_vals > 0.5).float().mean().item() if nnz_kept > 0 else 0.0
+        print(f"[SE-COREG DEBUG] coord_mode={coord_mode}, kept_frags={nnz_kept}, "
+            f"touched_gauss={touched}, dyn_frag_ratio={dyn_frag_ratio:.4f}, "
+            f"max_frac={frac.max().item():.4f}, mean_frac={(frac[total_counts>0].mean().item() if touched>0 else 0.0):.4f}, "
+            f"num_over={over.sum().item()}")
+
         return reset_mask
+
+
+
+
 
     @torch.no_grad()
     def _apply_reset_attributes(self, reset_mask: torch.Tensor, noise_ratio: float):
@@ -1557,14 +1548,26 @@ class Runner:
             if cfg.dino_loss_flag:
                 if not hasattr(self, "dino_extractor"):
                     self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
+                    # freeze DINO backbone parameters so we do not train the DINO model
+                    try:
+                        self.dino_extractor.dino_model.eval()
+                        for p in self.dino_extractor.dino_model.parameters():
+                            p.requires_grad = False
+                    except Exception:
+                        # defensive: some extractor implementations may differ
+                        pass
                 if not hasattr(self, "dino_head"):
                     # DINO 토큰(저해상도) -> 픽셀 해상도로 올리는 경량 업샘플 헤드
                     self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
+                    # we don't want to train the upsample head either (only splats should be updated)
+                    for p in self.dino_head.parameters():
+                        p.requires_grad = False
+                    self.dino_head.eval()
 
                 # self hard coded control
                 mask_adaptation = False
 
-                # 1) DINO 토큰 추출 (GT/Render) 
+                # 1) DINO 토큰 추출 (GT/Render)
                 gt_chw     = pixels.permute(0, 3, 1, 2)    # [B,3,H,W], GT
                 render_chw = colors.permute(0, 3, 1, 2)    # [B,3,H,W], 렌더 결과
 
@@ -1572,22 +1575,21 @@ class Runner:
                     mask_chw = binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W], 마스크
                     render_chw_safe = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw) # 마스크 영역은 렌더링 그래디언트가 안 흐르도록 처리
 
-                # ftok  = self.dino_extractor.extract_tokens(gt_chw)      # [B,Th*Tw,C] (백본 파라미터는 require_grad=False로 freeze)
-                # fhtok = self.dino_extractor.extract_tokens(render_chw)  # [B,Th*Tw,C]
-
-                with torch.no_grad():  
+                # Extract GT tokens without gradient to save memory
+                with torch.no_grad():
                     ftok,  Th, Tw, _, _  = self.dino_extractor.extract_tokens(gt_chw)
-                    if mask_adaptation and (binary_mask is not None):
-                        fhtok, Th2, Tw2, _, _  = self.dino_extractor.extract_tokens(render_chw_safe)      
-                    else:
-                        fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw) 
+
+                # Extract render tokens with gradient enabled so dino_loss can backprop to render pixels -> splats
+                if mask_adaptation and (binary_mask is not None):
+                    fhtok, Th2, Tw2, _, _  = self.dino_extractor.extract_tokens(render_chw_safe)
+                else:
+                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
 
                 assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
                 B, _, C = ftok.shape
 
                 f_gt  = ftok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()   # [B,C,Th,Tw]
                 f_rnd = fhtok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()  # [B,C,Th,Tw]
-
 
                 # 2) 업샘플 → 이미지 해상도 정렬
                 ps = self.dino_extractor.patch_size
@@ -1598,7 +1600,6 @@ class Runner:
 
                 # 오른쪽/아래만 패딩했으므로 좌상단 기준으로 원 해상도(H,W)로 자르기
                 H, W = colors.shape[1], colors.shape[2]
-                                                    # [B,1,H,W]
                 f_gt_up  = f_gt_up_pad[:,  :, :H, :W]   # [B,C,H,W]
                 f_rnd_up = f_rnd_up_pad[:, :, :H, :W]   # [B,C,H,W]
                 
@@ -1608,7 +1609,7 @@ class Runner:
                     dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
                 else:
                     dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
-                    
+
                 dino_loss =  dino_feat_loss
                 
             else:
@@ -1752,14 +1753,13 @@ class Runner:
 #revised-1013
             # ---------------- Self-Ensemble: pseudo-view render↔render loss ----------------
             se_coreg = torch.tensor(0.0, device=device)
-            if (
-                self.cfg.se_coreg_enable
-                and binary_mask is not None
-                # and cfg.se_coreg_start_iter < step
-                and cfg.refine_start_iter < step
-                and step % cfg.se_coreg_refine_every == 0
+            # 디버그: se_coreg 진입 조건 확인용 (train 루프 안, 조건문 바로 위)
+    
+            if (self.cfg.se_coreg_enable and binary_mask is not None and cfg.refine_start_iter < step and step % cfg.se_coreg_refine_every == 0
             ):
-                # TODO: implement pseudo view selection strategy
+            
+            # and cfg.se_coreg_start_iter < step
+                #: implement pseudo view selection strategy
                 # to use spotless-mlp classifier pixelwise model trained with binary mask and use that for pseudo view dynamic mask.
 
 
@@ -1841,14 +1841,16 @@ class Runner:
 
                 ### already exist camera view with delta perturbation model
 
+
                 if binary_mask.shape == (1, height, width, 1):
                         dyn_mask = binary_mask.squeeze(-1)
                 else:
                     dyn_mask = binary_mask.permute(0, 3, 1, 2).squeeze(1)
                 
                 # Render sigma (background) under no_grad to avoid storing activations
+                # Request packed mode so the renderer fills per-pixel gaussian ids in `info`.
                 with self._temporary_splats(self._clone_splats()):
-                    sigma_imgs, _, _ = self.rasterize_splats(
+                    sigma_imgs, _, info_sigma = self.rasterize_splats(
                         camtoworlds,
                         Ks,
                         width=width,
@@ -1856,10 +1858,12 @@ class Runner:
                         sh_degree=sh_degree_to_use,
                         near_plane=cfg.near_plane,
                         far_plane=cfg.far_plane,
+                        packed=True,
                     )
                     sigma_imgs = torch.clamp(sigma_imgs, 0.0, 1.0)
                 
-                reset_mask_pv = self._find_reset_gaussians_by_mask(dyn_mask, info)
+                # Use the packed-render info (which includes 'gaussian_ids') to find reset gaussians
+                reset_mask_pv = self._find_reset_gaussians_by_mask(dyn_mask, info_sigma, cameras=camtoworlds)
 
                 # Render delta (background + small perturb) with gradients enabled
                 delta_splats = self._clone_splats()
@@ -1867,6 +1871,8 @@ class Runner:
                 with self._temporary_splats(delta_splats):
                     self._apply_reset_attributes(reset_mask_pv, self._uap_noise_ratio(step))
                     with torch.no_grad():
+                        # delta render doesn't strictly need gaussian_ids, but enabling packed
+                        # is low-risk and keeps info consistent with the sigma render.
                         delta_imgs, _, _ = self.rasterize_splats(
                             camtoworlds,
                             Ks,
@@ -1875,6 +1881,7 @@ class Runner:
                             sh_degree=sh_degree_to_use,
                             near_plane=cfg.near_plane,
                             far_plane=cfg.far_plane,
+                            packed=True,
                         )
                     delta_imgs = torch.clamp(delta_imgs, 0.0, 1.0)
 
@@ -1896,7 +1903,10 @@ class Runner:
 
                 
             # total loss            
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) + se_coreg_loss *cfg.se_coreg_lambda + transient_loss_weighted * lambda_p
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda*0.01 ) + se_coreg_loss *cfg.se_coreg_lambda + transient_loss_weighted * lambda_p
+            if step % cfg.refine_every ==0 :
+                print (  f"Step {step}: rgbloss={rgbloss.item():.6f}, dino_loss={dino_loss.item() if torch.is_tensor(dino_loss) else dino_loss:.6f}, se_coreg_loss={se_coreg_loss.item() if torch.is_tensor(se_coreg_loss) else se_coreg_loss:.6f} ")
+
             # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda )  + (se_coreg_loss * cfg.se_coreg_lambda)* lambda_p + transient_loss_weighted * lambda_p
 # ----------------------------------------------------------------------------------------------------------------------------
 
