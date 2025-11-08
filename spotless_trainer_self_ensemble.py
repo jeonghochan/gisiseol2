@@ -1850,17 +1850,19 @@ class Runner:
                 # Render sigma (background) under no_grad to avoid storing activations
                 # Request packed mode so the renderer fills per-pixel gaussian ids in `info`.
                 with self._temporary_splats(self._clone_splats()):
-                    sigma_imgs, _, info_sigma = self.rasterize_splats(
-                        camtoworlds,
-                        Ks,
-                        width=width,
-                        height=height,
-                        sh_degree=sh_degree_to_use,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                        packed=True,
-                    )
-                    sigma_imgs = torch.clamp(sigma_imgs, 0.0, 1.0)
+                    with torch.no_grad():
+                        _, _, info_sigma = self.rasterize_splats(
+                            camtoworlds,
+                            Ks,
+                            width=width,
+                            height=height,
+                            sh_degree=sh_degree_to_use,
+                            near_plane=cfg.near_plane,
+                            far_plane=cfg.far_plane,
+                            packed=True,
+                        )
+                    # renders image use!
+                    sigma_imgs = torch.clamp(renders, 0.0, 1.0)
                 
                 # Use the packed-render info (which includes 'gaussian_ids') to find reset gaussians
                 reset_mask_pv = self._find_reset_gaussians_by_mask(dyn_mask, info_sigma, cameras=camtoworlds)
