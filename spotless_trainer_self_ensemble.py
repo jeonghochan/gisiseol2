@@ -210,7 +210,7 @@ class Config:
 
     se_coreg_enable: bool = True
     se_coreg_start_iter: int = 7000
-    se_coreg_lambda: float = 0.1 #0.5            # render↔render loss 계수
+    se_coreg_lambda: float = 10#0.5
     se_pseudo_K: int = 2                    # pseudo view 개수
     se_coreg_refine_every: int = 100    # self-ensemble 
     # fallback jitter (cameras.PseudoCamera 미사용시)
