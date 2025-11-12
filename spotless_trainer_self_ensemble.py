@@ -210,7 +210,7 @@ class Config:
 
     se_coreg_enable: bool = True
     se_coreg_start_iter: int = 7000
-    se_coreg_lambda: float = 10#0.5
+    se_coreg_lambda: float = 0.1#0.5
     se_pseudo_K: int = 2                    # pseudo view 개수
     se_coreg_refine_every: int = 100    # self-ensemble 
     # fallback jitter (cameras.PseudoCamera 미사용시)
@@ -1604,11 +1604,12 @@ class Runner:
                 f_rnd_up = f_rnd_up_pad[:, :, :H, :W]   # [B,C,H,W]
                 
                 # 3) 코사인 불일치(=의미 차이) 맵 -> 배경(inlier) 영역에서만 정합 유도
-                cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]       
+                cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]
                 if mask_adaptation and (binary_mask is not None):
                     dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
                 else:
-                    dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
+                    # dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
+                    dino_feat_loss = (cosd).mean() #이게 맞는거 같은데
 
                 dino_loss =  dino_feat_loss
                 
