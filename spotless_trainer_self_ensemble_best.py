@@ -132,12 +132,12 @@ class Config:
 
     # Start refining GSs after this iteration
     # Stop refining GSs after this iteration
-    refine_start_iter: int = 100
+    refine_start_iter: int = 500
     refine_stop_iter: int = 20000 # tag
     # Reset opacities every this steps
     reset_every: int = 300000
     # Refine GSs every this steps
-    refine_every: int = 100
+    refine_every: int = 200
     # Reset SH specular coefficients once
     reset_sh: int = 8002
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
