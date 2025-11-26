@@ -39,6 +39,9 @@ from gsplat.rendering import rasterization
 from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead, ConvDPT
 # from transient_utils import ConvDPT
 
+#for feature map save
+# import imageio.v2 as imageio
+# from sklearn.decomposition import PCA
 
 
 @dataclass
@@ -132,12 +135,12 @@ class Config:
 
     # Start refining GSs after this iteration
     # Stop refining GSs after this iteration
-    refine_start_iter: int = 500
-    refine_stop_iter: int = 20000 # tag
+    refine_start_iter: int = 500 #100
+    refine_stop_iter: int = 15000 # tag
     # Reset opacities every this steps
     reset_every: int = 300000
     # Refine GSs every this steps
-    refine_every: int = 200
+    refine_every: int = 100
     # Reset SH specular coefficients once
     reset_sh: int = 8002
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -147,7 +150,7 @@ class Config:
     # Use absolute gradient for pruning. This typically requires larger --grow_grad2d, e.g., 0.0008 or 0.0006
     absgrad: bool = False
     # Use utilization-based pruning (UBP) for compression: xection 4.2.3 https://arxiv.org/pdf/2406.20055
-    ubp: bool = True
+    ubp: bool = False
     # Threshold for UBP
     ubp_thresh: float = 1e-14
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
@@ -188,7 +191,7 @@ class Config:
     #mask directory
     mask_dir: Optional[str] = None
     #someday to change 
-    # seed : int = 42
+    seed : int = 42
     pseudo_gt_dir: Optional[str] = None  # temporary directory for pseudo GT
 
     # Weight for MLP mask loss
@@ -196,6 +199,7 @@ class Config:
     # Weight for DINO feature loss
     dino_loss_flag: bool = True
     dino_loss_lambda: float = 0.2 #tag
+    mask_adaptation: bool = False
     
 
     #parameter for self-ensemble-revised-1013
@@ -210,38 +214,17 @@ class Config:
 
     se_coreg_enable: bool = True
     se_coreg_start_iter: int = 7000
-    se_coreg_lambda: float = 0.1 #0.5            # render↔render loss 계수
-    se_pseudo_K: int = 2                    # pseudo view 개수
+    se_coreg_lambda: float = 0.1
     se_coreg_refine_every: int = 100    # self-ensemble 
-    # fallback jitter (cameras.PseudoCamera 미사용시)
-    se_jitter_deg: float = 1.0              # yaw/pitch/roll 표준편차(도)
-    se_jitter_trans: float = 0.01           # 번역 표준편차(장면스케일 비율)
-    #--------------------------------------------------------------
-    
-    #revised-1015
-    #-----------------for opacity based pruning---
-    gaussian_visibility_thresh: float = 0.05# Threshold for Gaussian visibility ratio (0.08 -> 0.15로 증가해서 더 많이 pruning) 
-    start_pseudo_view_iter: int = 7000 # Start opacity-based pruning earlier (7000 -> 5000)
 
-    #revised-1016 - Advanced Floater Detection
-    #-----------------for advanced floater detection algorithms---
-    enable_depth_floater_detection: bool = True    # Depth-based floater detection
-    depth_floater_thresh: float = 0.005                # Depth inconsistency threshold
-    # Ghost/Transparency Artifact Fix
-    #-----------------for handling under-reconstructed dynamic regions---
-    dynamic_prune_start_iter: int = 15000          # When to start aggressive pruning
-    enable_dynamic_inpainting: bool = True          # Fill dynamic regions with nearby background Gaussians
-    #--------------------------------------------------------------
-    #revised-1017
-    # Transient parameters
-    transient_training_enable: bool = False    # on/off
-    transient_loss_start_iter: int = 7000     # iteration부터 main loss에 transient loss 적용
-    KL_threshold: float = 0.5           # KL divergence threshold for masking
-    schedule_beta: float = -3e-3        # Alpha sampling schedule rate
     #revised-1028
     # Minimum age (in training steps) before a newly created Gaussian can be
     # pruned. Helps avoid immediate prune after duplication/splitting.
     min_age_before_prune: int = 150
+
+    #revised11-18
+    # Learning rate warmup steps
+    lr_warmup_steps: int = 1000
 
   
 
@@ -323,30 +306,12 @@ def create_splats_with_optimizers(
     ]
     return splats, optimizers
 
-#revised-0919
-# ---- (NEW) mask weight per-fragment / per-gaussian ----
-# binary_mask: [1,H,W,1] with 1=static, 0=dynamic
-# Convert to BCHW for grid_sample
-# means2d positions are in normalized [-1,1] screen space (same space grads use)
-# We'll sample mask at those positions as weights in [0,1].
-def sample_mask_at_means2d(means2d_xy: torch.Tensor, binary_mask: torch.Tensor) -> torch.Tensor:
-    """
-    means2d_xy: [..., 2] in [-1,1]
-    returns: [...] in [0,1]
-    """
-    shp = means2d_xy.shape
-    grid = means2d_xy.reshape(1, -1, 1, 2)           # [1, M, 1, 2]
-    m_bchw = binary_mask.permute(0, 3, 1, 2)  # [1,1,H,W]
-    w = F.grid_sample(m_bchw, grid, align_corners=True)  # [1,1,M,1]
-    w = w.view(-1)                                   # [M]
-    return w.reshape(*shp[:-1])                      # [...]
 
 class Runner:
     """Engine for training and testing."""
 
     def __init__(self, cfg: Config) -> None:
-        set_random_seed(42)
-
+        set_random_seed(cfg.seed)
         self.cfg = cfg
         self.device = "cuda"
 
@@ -495,8 +460,8 @@ class Runner:
                     lr=1e-3,
                 )
             ]
-            # self.spotless_loss = lambda p, minimum, maximum: torch.mean(
-            #     torch.nn.ReLU()(p - minimum) + torch.nn.ReLU()(maximum - p))
+            self.spotless_loss = lambda p, minimum, maximum: torch.mean(
+                torch.nn.ReLU()(p - minimum) + torch.nn.ReLU()(maximum - p))
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -514,14 +479,6 @@ class Runner:
         self.transient_model = None
         self.transient_optimizer = None
         self.transient_scheduler = None
-
-        # transient model initialization
-        self.transient_model = ConvDPT(self.dino_extractor.dino_model.embed_dim).to(self.device)
-        self.transient_model.train()
-        self.transient_optimizer = torch.optim.Adam(self.transient_model.parameters(), lr=5e-3)
-        self.transient_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.transient_optimizer, cfg.max_steps, 2e-4
-        )
 #------------------------------------------------------------------------------------------------------------
         # Viewer
         if not self.cfg.disable_viewer:
@@ -599,200 +556,6 @@ class Runner:
             **kwargs,
         )
 
-        # # Debug: print image size and sample sizes of up to 10 splatted Gaussians
-        # try:
-        #     W = int(width)
-        #     H = int(height)
-        #     # determine candidate gaussian ids
-        #     if "gaussian_ids" in info and info["gaussian_ids"] is not None:
-        #         try:
-        #             unique_ids = torch.unique(info["gaussian_ids"].long())
-        #         except Exception:
-        #             unique_ids = torch.arange(len(means), device=means.device)
-        #     else:
-        #         unique_ids = torch.arange(len(means), device=means.device)
-
-        #     num_to_show = min(10, unique_ids.numel())
-        #     sample_ids = unique_ids[:num_to_show].cpu().numpy().tolist()
-
-        #     # try to extract radii (image-space) if available, otherwise fall back to world-space scales
-        #     radii_info = info.get("radii", None)
-        #     sizes = []
-        #     if radii_info is not None and isinstance(radii_info, torch.Tensor):
-        #         r = radii_info
-        #         if r.dim() == 2:
-        #             # [C, N] -> take max across channels
-        #             per_gauss = r.max(dim=0).values
-        #             for idx in sample_ids:
-        #                 sizes.append(float(per_gauss[idx].cpu().item()))
-        #         elif r.dim() == 1 and "gaussian_ids" in info:
-        #             # per-fragment radii: aggregate by gaussian id
-        #             gid = info["gaussian_ids"].long().view(-1)
-        #             per_frag = r.view(-1)
-        #             per_gauss = torch.zeros(len(means), device=means.device)
-        #             per_gauss.index_add_(0, gid, per_frag)
-        #             counts = torch.bincount(gid, minlength=len(means)).float().clamp_min(1.0)
-        #             per_gauss = per_gauss / counts
-        #             for idx in sample_ids:
-        #                 sizes.append(float(per_gauss[idx].cpu().item()))
-        #         else:
-        #             for idx in sample_ids:
-        #                 sizes.append(float(r[idx].cpu().item() if idx < r.numel() else 0.0))
-        #     else:
-        #         # fallback: use world-space scales (max of 3 axes)
-        #         for idx in sample_ids:
-        #             s = scales[idx].max().cpu().item()
-        #             sizes.append(float(s))
-
-        #     print(f"[DEBUG] Image WxH: {W}x{H}. Showing {num_to_show} Gaussian sizes (pixels or fallback world-units) for IDs {sample_ids}: {sizes}")
-        # except Exception as e:
-        #     print(f"[DEBUG] Failed to print gaussian sizes: {e}")
-        # # Debug: print image size and sample sizes of up to 10 splatted Gaussians
-        # try:
-        #     W = int(width)
-        #     H = int(height)
-        #     # determine candidate gaussian ids
-        #     if "gaussian_ids" in info and info["gaussian_ids"] is not None:
-        #         try:
-        #             unique_ids = torch.unique(info["gaussian_ids"].long())
-        #         except Exception:
-        #             unique_ids = torch.arange(len(means), device=means.device)
-        #     else:
-        #         unique_ids = torch.arange(len(means), device=means.device)
-
-        #     num_to_show = min(10, unique_ids.numel())
-        #     sample_ids = unique_ids[:num_to_show].cpu().numpy().tolist()
-
-        #     # try to extract radii (image-space) if available, otherwise fall back to world-space scales
-        #     radii_info = info.get("radii", None)
-        #     sizes = []
-        #     if radii_info is not None and isinstance(radii_info, torch.Tensor):
-        #         r = radii_info
-        #         if r.dim() == 2:
-        #             # [C, N] -> take max across channels
-        #             per_gauss = r.max(dim=0).values
-        #             for idx in sample_ids:
-        #                 sizes.append(float(per_gauss[idx].cpu().item()))
-        #         elif r.dim() == 1 and "gaussian_ids" in info:
-        #             # per-fragment radii: aggregate by gaussian id
-        #             gid = info["gaussian_ids"].long().view(-1)
-        #             per_frag = r.view(-1)
-        #             per_gauss = torch.zeros(len(means), device=means.device)
-        #             per_gauss.index_add_(0, gid, per_frag)
-        #             counts = torch.bincount(gid, minlength=len(means)).float().clamp_min(1.0)
-        #             per_gauss = per_gauss / counts
-        #             for idx in sample_ids:
-        #                 sizes.append(float(per_gauss[idx].cpu().item()))
-        #         else:
-        #             for idx in sample_ids:
-        #                 sizes.append(float(r[idx].cpu().item() if idx < r.numel() else 0.0))
-        #     else:
-        #         # fallback: use world-space scales (max of 3 axes)
-        #         for idx in sample_ids:
-        #             s = scales[idx].max().cpu().item()
-        #             sizes.append(float(s))
-
-        #     print(f"[DEBUG] Image WxH: {W}x{H}. Showing {num_to_show} Gaussian sizes (pixels or fallback world-units) for IDs {sample_ids}: {sizes}")
-        # except Exception as e:
-        #     print(f"[DEBUG] Failed to print gaussian sizes: {e}")
-        # means2d = info.get("means2d", None)
-        # if means2d is not None and isinstance(means2d, torch.Tensor):
-        #     # 만약 means2d가 normalized [-1,1]이라면:
-        #     m = means2d.detach().cpu()  # shape [nnz, 2] 혹은 [N,2]
-        #     # 보장: 2차원 배열로 변환
-        #     try:
-        #         m = m.reshape(-1, 2)
-        #     except Exception:
-        #         # 만약 이미 numpy라면 변환
-        #         m = m
-        #     # 예: normalized -> pixel coords (NumPy로 계산해 scalar int 확보)
-        #     m_np = m.numpy()
-        #     pix_x = ((m_np[:, 0] + 1.0) / 2.0 * (W - 1)).astype(int)
-        #     pix_y = ((1.0 - (m_np[:, 1] + 1.0) / 2.0) * (H - 1)).astype(int)  # y 방향 주의
-        #     # radii per gaussian (per_gauss 계산 필요). 안전하게 정의해 둠
-        #     try:
-        #         _per_gauss = None
-        #         if "per_gauss" in locals():
-        #             _per_gauss = per_gauss.detach().cpu().numpy()
-        #         else:
-        #             # fallback: use world-space scales (max of 3 axes)
-        #             _per_gauss = scales.max(dim=-1).values.detach().cpu().numpy()
-        #     except Exception:
-        #         _per_gauss = None
-
-        #     import cv2
-        #     # Use the rendered image (render_colors) for visualization
-        #     try:
-        #         im = (render_colors[0].detach().cpu().numpy() * 255).astype(np.uint8)  # [H,W,3]
-        #     except Exception:
-        #         # fallback if render_colors is not as expected
-        #         im = np.zeros((H, W, 3), dtype=np.uint8)
-
-        #     # Save the raw rendered image for diagnosis
-        #     try:
-        #         raw_path = os.path.join(getattr(self.cfg, 'result_dir', '.') or '.', 'debug_render.png')
-        #         cv2.imwrite(raw_path, im)
-        #         print(f"[DEBUG] wrote raw render to {os.path.abspath(raw_path)}")
-        #     except Exception as ee:
-        #         print(f"[DEBUG] failed to write raw render: {ee}")
-        #     H_img, W_img = im.shape[0], im.shape[1]
-        #     for i, (x, y) in enumerate(zip(pix_x[:50], pix_y[:50])):  # 상위 50개만
-        #         try:
-        #             r = int(_per_gauss[i]) if (_per_gauss is not None and i < len(_per_gauss)) else 5
-        #         except Exception:
-        #             r = 5
-        #         # 안전하게 int로 변환하고 이미지 경계 내로 클램프
-        #         cx = int(x) if isinstance(x, (int, np.integer)) else int(x.item()) if hasattr(x, 'item') else int(x)
-        #         cy = int(y) if isinstance(y, (int, np.integer)) else int(y.item()) if hasattr(y, 'item') else int(y)
-        #         cx = max(0, min(W_img - 1, cx))
-        #         cy = max(0, min(H_img - 1, cy))
-        #         rr = max(1, int(r))
-        #         # draw a filled circle with thicker border for visibility
-        #         cv2.circle(im, (cx, cy), rr, (0, 255, 0), -1)
-        #         cv2.circle(im, (cx, cy), rr + 1, (0, 0, 0), 1)
-        #     # write to tmp (platform neutral path if possible)
-        #     try:
-        #         # ensure image is H x W x 3
-        #         if im.ndim == 2:
-        #             im_to_save = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
-        #         elif im.shape[2] == 4:
-        #             im_to_save = im[:, :, :3]
-        #         else:
-        #             im_to_save = im
-
-        #         out_dir = getattr(self.cfg, 'result_dir', '.') or '.'
-        #         out_path = os.path.join(out_dir, f"debug_overlay.png")
-        #         ok = cv2.imwrite(out_path, im_to_save)
-        #         print(f"[DEBUG] wrote overlay to {os.path.abspath(out_path)} success={ok}")
-        #     except Exception as ee:
-        #         print(f"[DEBUG] failed to write overlay: {ee}")
-        #     # Print diagnostic info about radii/means2d to help root-cause the all-zero sizes
-        #     try:
-        #         print('[DEBUG] info keys:', list(info.keys()))
-        #         if 'radii' in info and isinstance(info['radii'], torch.Tensor):
-        #             r = info['radii']
-        #             try:
-        #                 print('[DEBUG] radii shape:', r.shape, 'min/max:', float(r.min()), float(r.max()))
-        #             except Exception:
-        #                 print('[DEBUG] radii sample (flatten):', r.view(-1)[:20])
-        #         if 'gaussian_ids' in info and isinstance(info['gaussian_ids'], torch.Tensor):
-        #             gid = info['gaussian_ids'].long().view(-1)
-        #             print('[DEBUG] gaussian_ids shape:', gid.shape, 'unique count sample:', torch.unique(gid)[:20])
-        #         if 'means2d' in info and isinstance(info['means2d'], torch.Tensor):
-        #             m = info['means2d'].detach().cpu()
-        #             try:
-        #                 print('[DEBUG] means2d sample:', m.reshape(-1,2)[:10])
-        #             except Exception:
-        #                 print('[DEBUG] means2d sample (raw):', m[:10])
-        #         # world-space scales
-        #         try:
-        #             print('[DEBUG] world scales sample:', torch.exp(self.splats['scales']).max(dim=-1).values[:10])
-        #         except Exception:
-        #             pass
-        #     except Exception as e:
-        #         print('[DEBUG] failed to print diagnostics:', e)
-
-
         return render_colors, render_alphas, info
     
     def robust_mask(
@@ -836,13 +599,6 @@ class Runner:
 
     #revised
     def get_ssim_lambda(self, step:int) -> float:
-                cfg = self.cfg
-                # ramp_end = int(0.5 * cfg.max_steps) 
-                # t = min(step / max(ramp_end, 1), 1.0)
-                # wt = 0.5 - 0.5 * math.cos(math.pi * t) 
-                # # return wt * cfg.ssim_lambda
-                # return wt
-
                 cfg = self.cfg
                 ramp_start = cfg.min_steps
                 ramp_end = int(0.5 * cfg.max_steps)
@@ -900,33 +656,6 @@ class Runner:
         t = min(step / T, 1.0)
         # print("uap noise ration fucn works")
         return self.cfg.uap_noise_init + (self.cfg.uap_noise_final - self.cfg.uap_noise_init) * t
-    
-
-    @torch.no_grad()
-    def _make_pseudo_views(self, camtoworlds: Tensor, Ks: Tensor, K: int) -> Tuple[Tensor, Tensor]:
-        """
-        소각도 SE(3) jitter로 fallback 생성
-        반환: (C2W[K,4,4], K[K,3,3])
-        """
-        device = camtoworlds.device
-        c2w0 = camtoworlds.repeat(K, 1, 1).clone()
-        rad = math.pi / 180.0
-        ang = torch.randn(K, 3, device=device) * (self.cfg.se_jitter_deg * rad)
-        trans = torch.randn(K, 3, device=device) * (self.cfg.se_jitter_trans * self.scene_scale)
-
-        def Rxyz(ax, ay, az):
-            Rx = torch.tensor([[1, 0, 0], [0, torch.cos(ax), -torch.sin(ax)], [0, torch.sin(ax), torch.cos(ax)]], device=device)
-            Ry = torch.tensor([[torch.cos(ay), 0, torch.sin(ay)], [0, 1, 0], [-torch.sin(ay), 0, torch.cos(ay)]], device=device)
-            Rz = torch.tensor([[torch.cos(az), -torch.sin(az), 0], [torch.sin(az), torch.cos(az), 0], [0, 0, 1]], device=device)
-            return Rz @ Ry @ Rx
-
-        for i in range(K):
-            R = Rxyz(*ang[i])
-            c2w0[i, :3, :3] = R @ c2w0[i, :3, :3]
-            c2w0[i, :3, 3] = c2w0[i, :3, 3] + trans[i]
-      
-        # print("make pseudo view with manual jittering works")
-        return c2w0, Ks.repeat(K, 1, 1)
 
     @torch.no_grad()
     def _clone_splats(self) -> torch.nn.ParameterDict:
@@ -1112,252 +841,6 @@ class Runner:
             alpha = torch.sigmoid(opa)
             alpha[mask] = torch.clamp(alpha[mask] * factor, 1e-6, 1 - 1e-6)
             self.splats["opacities"].data = torch.logit(alpha)
-#revised-1016-------------------------------------------------------------------------------------------
-    @torch.no_grad()
-    def _detect_depth_inconsistent_gaussians(
-        self, camtoworlds: Tensor, Ks: Tensor, width: int, height: int, 
-        dyn_mask: Tensor, depth_threshold: float = 0.5
-    ) -> torch.Tensor:
-        """
-        Depth-based floater detection:
-        렌더링된 깊이와 동적 마스크를 비교하여 배경 앞에 떠있는 floater를 감지
-        
-        Args:
-            camtoworlds: [1, 4, 4]
-            Ks: [1, 3, 3]
-            width, height: image dimensions
-            dyn_mask: [1,H,W] or [1,H,W,1], 1=static, 0=dynamic
-            depth_threshold: 깊이 불일치 임계값 (normalized depth 기준)
-        
-        Returns:
-            [N] boolean mask indicating floaters
-        """
-        device = self.device
-        N = len(self.splats["means3d"])
-        
-        # Render depth map
-        renders, _, info = self.rasterize_splats(
-            camtoworlds=camtoworlds,
-            Ks=Ks,
-            width=width,
-            height=height,
-            sh_degree=self.cfg.sh_degree,
-            near_plane=self.cfg.near_plane,
-            far_plane=self.cfg.far_plane,
-            render_mode="RGB+ED",
-            packed=True
-        )
-        
-        if renders.shape[-1] < 4:
-            return torch.zeros(N, dtype=torch.bool, device=device)
-        
-        depth_map = renders[..., 3:4]  # [1, H, W, 1]
-        
-        # Normalize depth
-        valid_depth = depth_map[depth_map > 0]
-        if valid_depth.numel() == 0:
-            return torch.zeros(N, dtype=torch.bool, device=device)
-        
-        depth_min, depth_max = valid_depth.min(), valid_depth.max()
-        depth_normalized = (depth_map - depth_min) / (depth_max - depth_min + 1e-6)
-        
-        # dyn_mask 차원 맞추기
-        if dyn_mask.dim() == 4:
-            dyn_mask = dyn_mask.squeeze(-1)  # [1,H,W]
-        
-        # 동적 영역(0)에서의 깊이 통계
-        dyn_region = (dyn_mask[0] < 0.5)  # [H,W]
-        stat_region = (dyn_mask[0] >= 0.5)  # [H,W]
-        
-        if not dyn_region.any() or not stat_region.any():
-            return torch.zeros(N, dtype=torch.bool, device=device)
-        
-        # 주변 정적 영역의 평균 깊이 계산 (morphological dilation)
-        kernel_size = 15
-        dyn_dilated = F.max_pool2d(
-            dyn_region.float().unsqueeze(0).unsqueeze(0),
-            kernel_size=kernel_size, stride=1, padding=kernel_size//2
-        ).squeeze()
-        
-        # 동적 영역 주변의 정적 영역
-        border_region = (dyn_dilated > 0.5) & stat_region
-        
-        if border_region.any():
-            border_depth_mean = depth_normalized[0, border_region].mean()
-            
-            # 각 Gaussian의 깊이와 비교
-            means3d = self.splats["means3d"]  # [N, 3]
-            cam_pos = camtoworlds[0, :3, 3]  # [3]
-            
-            # Gaussian의 카메라로부터의 거리
-            gauss_depth = torch.norm(means3d - cam_pos[None, :], dim=1)  # [N]
-            gauss_depth_normalized = (gauss_depth - gauss_depth.min()) / (gauss_depth.max() - gauss_depth.min() + 1e-6)
-            
-            # 동적 마스크 영역에 주로 나타나면서 주변 배경보다 앞에 있는 Gaussian 감지
-            if hasattr(self.running_stats, 'w_dynamic') and hasattr(self.running_stats, 'w_static'):
-                w_dyn = self.running_stats["w_dynamic"]
-                w_stat = self.running_stats["w_static"]
-                total_w = w_dyn + w_stat + 1e-6
-                dynamic_ratio = w_dyn / total_w
-                
-                # 동적 영역에 자주 나타나고(>0.5), 배경보다 앞에 있는 Gaussian
-                is_in_dynamic = dynamic_ratio > 0.5
-                is_in_front = gauss_depth_normalized < (border_depth_mean - depth_threshold)
-                
-                floater_mask = is_in_dynamic & is_in_front
-                return floater_mask
-        print("depth inconsistent gaussians detection works")
-        return torch.zeros(N, dtype=torch.bool, device=device)
-
-    @torch.no_grad()
-    def _inpaint_dynamic_regions(
-        self, binary_mask: torch.Tensor, camtoworlds: Tensor, inpaint_strength: float
-    ) -> int:
-        """
-        동적 영역의 "구멍"을 주변 배경 Gaussian으로 채우기 (inpainting)
-        
-        전략: 동적 영역 경계 근처의 정적 Gaussian을 복제하여 구멍을 메움
-        
-        Args:
-            binary_mask: [1,H,W] or [1,H,W,1], 1=static, 0=dynamic
-            camtoworlds: [1, 4, 4]
-            inpaint_strength: 복제할 Gaussian 비율
-        
-        Returns:
-            복제된 Gaussian 개수
-        """
-        device = self.device
-        
-        # binary_mask 차원 정규화
-        if binary_mask.dim() == 4:
-            binary_mask = binary_mask.squeeze(-1)  # [1,H,W]
-        
-        # 동적 영역과 정적 영역 경계 찾기
-        dyn_region = (binary_mask[0] < 0.5).float()  # [H,W]
-        
-        # 동적 영역 경계 (erosion + dilation 차이)
-        kernel_size = 7
-        dyn_eroded = -F.max_pool2d(
-            -dyn_region.unsqueeze(0).unsqueeze(0),
-            kernel_size=kernel_size, stride=1, padding=kernel_size//2
-        ).squeeze()
-        dyn_dilated = F.max_pool2d(
-            dyn_region.unsqueeze(0).unsqueeze(0),
-            kernel_size=kernel_size, stride=1, padding=kernel_size//2
-        ).squeeze()
-        
-        # 경계 영역 (동적 영역 주변)
-        border_region = (dyn_dilated > 0.5) & (dyn_eroded < 0.5)
-        
-        # 카메라 위치
-        cam_pos = camtoworlds[0, :3, 3]  # [3]
-        means3d = self.splats["means3d"]  # [N, 3]
-        
-        # 각 Gaussian을 카메라 평면에 투영하여 경계 영역 근처인지 확인
-        # (간단한 근사: 3D 거리로 대체)
-        
-        # 경계 영역의 중심 계산 (world space)
-        border_pixels = torch.where(border_region)
-        if len(border_pixels[0]) == 0:
-            return 0
-        
-        # 정적 영역의 Gaussian 중 경계 근처에 있는 것 찾기
-        if hasattr(self.running_stats, 'w_static') and hasattr(self.running_stats, 'w_dynamic'):
-            w_stat = self.running_stats["w_static"]
-            w_dyn = self.running_stats["w_dynamic"]
-            total_w = w_stat + w_dyn + 1e-6
-            static_ratio = w_stat / total_w
-            
-            # 주로 정적 영역에 나타나는 Gaussian (>80%)
-            is_background = static_ratio > 0.6
-            
-            # 이 중 일부를 복제하여 동적 영역으로 확장
-            bg_indices = torch.where(is_background)[0]
-            if bg_indices.numel() == 0:
-                return 0
-            
-            # 무작위로 일부 선택
-            n_to_copy = int(bg_indices.numel() * inpaint_strength)
-            if n_to_copy == 0:
-                return 0
-            
-            perm = torch.randperm(bg_indices.numel(), device=device)
-            to_copy = bg_indices[perm[:n_to_copy]]
-            
-            # 분할(splitting): 선택한 배경 가우시안을 복제하고,
-            # 원본과 복제본 모두에 가우시안 노이즈를 주입해 동적 영역으로 확장
-            N_before = len(means3d)
-            copy_mask = torch.zeros(N_before, dtype=torch.bool, device=device)
-            copy_mask[to_copy] = True
-            self.refine_duplicate(copy_mask)
-
-            # 새로 생성된 가우시안 인덱스 계산
-            N_after = len(self.splats["means3d"])  # 업데이트된 길이
-            new_created = N_after - N_before
-            if new_created <= 0:
-                return 0
-            # 일반적으로 refine_duplicate는 선택된 각 항목을 1개씩 복제한다고 가정
-            new_indices = torch.arange(N_after - new_created, N_after, device=device)
-
-            # 원본+복제본 모두에 노이즈 주입
-            cfg = self.cfg
-            idx_all = torch.cat([to_copy, new_indices])
-
-            # 노이즈 스케일(안전한 기본값 제공, cfg에서 덮어쓰기 가능)
-            pos_sigma   = float(getattr(cfg, "split_pos_noise", 0.01)) * float(self.scene_scale)
-            scale_sigma = float(getattr(cfg, "split_scale_noise", 0.05))
-            quat_sigma  = float(getattr(cfg, "split_quat_noise", 0.02))
-            alpha_sigma = float(getattr(cfg, "split_alpha_noise", 0.02))
-            sh_sigma    = float(getattr(cfg, "split_sh_noise", 0.02))
-            feat_sigma  = float(getattr(cfg, "split_feature_noise", 0.01))
-
-            # means3d: 위치 노이즈
-            if "means3d" in self.splats:
-                m = self.splats["means3d"].data
-                m[idx_all] = m[idx_all] + torch.randn_like(m[idx_all]) * pos_sigma
-
-            # scales: log-space 노이즈(과도한 폭주 방지 위해 클램프)
-            if "scales" in self.splats:
-                s = self.splats["scales"].data
-                s[idx_all] = s[idx_all] + torch.randn_like(s[idx_all]) * scale_sigma
-                s[idx_all] = torch.clamp(s[idx_all], min=-5.0, max=5.0)  # exp 후 합리적 범위 유지를 위한 로그 스페이스 클램프
-
-            # quats: 소규모 노이즈 후 정규화
-            if "quats" in self.splats:
-                q = self.splats["quats"].data
-                q[idx_all] = q[idx_all] + torch.randn_like(q[idx_all]) * quat_sigma
-                q[idx_all] = q[idx_all] / (q[idx_all].norm(dim=-1, keepdim=True) + 1e-8)
-
-            # opacities: 알파 도메인에서 노이즈 → 다시 로그잇으로
-            if "opacities" in self.splats:
-                opa = self.splats["opacities"].data
-                alpha = torch.sigmoid(opa[idx_all])
-                alpha = alpha + torch.randn_like(alpha) * alpha_sigma
-                alpha = torch.clamp(alpha, 1e-6, 1 - 1e-6)
-                opa[idx_all] = torch.logit(alpha)
-
-            # SH 계수 또는 색/특징에 노이즈
-            if "sh0" in self.splats:
-                sh0 = self.splats["sh0"].data
-                sh0[idx_all] = sh0[idx_all] + torch.randn_like(sh0[idx_all]) * sh_sigma
-            if "shN" in self.splats:
-                shN = self.splats["shN"].data
-                shN[idx_all] = shN[idx_all] + torch.randn_like(shN[idx_all]) * sh_sigma
-            if "colors" in self.splats:
-                cols = self.splats["colors"].data
-                cols[idx_all] = cols[idx_all] + torch.randn_like(cols[idx_all]) * sh_sigma
-            if "features" in self.splats:
-                feats = self.splats["features"].data
-                feats[idx_all] = feats[idx_all] + torch.randn_like(feats[idx_all]) * feat_sigma
-
-            # 실제로 분할된 개수 반환(보호적으로 계산)
-            return int(min(n_to_copy, new_created))
-        
-        # If none of the inpainting branches ran (for example if running
-        # statistics keys are missing), ensure an integer is returned so the
-        # caller can safely compare the result (avoid NoneType > int error).
-        return 0
-
 #-------------------------------------------------------------------------------------------------------------------------
 
     def train(self):
@@ -1377,22 +860,64 @@ class Runner:
         with open(f"{cfg.result_dir}/cfg.json", "w") as f:
             json.dump(vars(cfg), f)
 
+        #revised 11-18
         max_steps = cfg.max_steps
         init_step = 0
 
-        schedulers = [
-            # means3d has a learning rate schedule, that end at 0.01 of the initial value
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers[0], gamma=0.01 ** (1.0 / max_steps)
-            ),
-        ]
+        # --- LR 웜업 스케줄러 로직 시작 ---
+        schedulers = []
+        
+        # 웜업 후 실제 감속(decay)이 일어날 스텝 수 계산
+        main_decay_steps = max(1, max_steps - cfg.lr_warmup_steps)
+
+        # 1. 메인 옵티마이저 (means3d 등) 스케줄
+        optimizer_main = self.optimizers[0]
+        
+        # 웜업 스케줄러 (예: 0.01배 LR -> 1.0배 LR)
+        warmup_scheduler_main = torch.optim.lr_scheduler.LinearLR(
+            optimizer_main,
+            start_factor=0.01, # 웜업 시작 시 LR 배율
+            end_factor=1.0,
+            total_iters=cfg.lr_warmup_steps
+        )
+        
+        # 메인 감속 스케줄러 (기존 ExponentialLR)
+        decay_scheduler_main = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer_main, 
+            gamma=0.01 ** (1.0 / main_decay_steps) # 웜업 이후 스텝에 대해서만 감속
+        )
+        
+        # 두 스케줄러를 순차적으로 연결
+        sequential_scheduler_main = torch.optim.lr_scheduler.SequentialLR(
+            optimizer_main,
+            schedulers=[warmup_scheduler_main, decay_scheduler_main],
+            milestones=[cfg.lr_warmup_steps] # 웜업 스텝 이후에 decay_scheduler_main으로 전환
+        )
+        schedulers.append(sequential_scheduler_main)
+
+        # 2. 포즈 옵티마이저 (pose_opt) 스케줄 (활성화된 경우)
         if cfg.pose_opt:
-            # pose optimization has a learning rate schedule
-            schedulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
-                )
+            optimizer_pose = self.pose_optimizers[0]
+            
+            warmup_scheduler_pose = torch.optim.lr_scheduler.LinearLR(
+                optimizer_pose,
+                start_factor=0.01,
+                end_factor=1.0,
+                total_iters=cfg.lr_warmup_steps
             )
+            
+            decay_scheduler_pose = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer_pose, 
+                gamma=0.01 ** (1.0 / main_decay_steps) # 동일한 스텝 수 적용
+            )
+            
+            sequential_scheduler_pose = torch.optim.lr_scheduler.SequentialLR(
+                optimizer_pose,
+                schedulers=[warmup_scheduler_pose, decay_scheduler_pose],
+                milestones=[cfg.lr_warmup_steps]
+            )
+            schedulers.append(sequential_scheduler_pose)
+        # --- LR 웜업 스케줄러 로직 끝 ---
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
@@ -1459,38 +984,9 @@ class Runner:
 
             #binary mask init - MOVED BEFORE rasterize_splats
             binary_mask = None
-            
-            if self.mask_dir:
-                mpath = self.mask_dict.get(mask_name, None)
-                if mpath:
-                    # mask load & process
-                    mask_img = imageio.imread(mpath)
-                    if mask_img.ndim == 3:
-                        print("[WARN] mask image has 3 channels, converting to grayscale")
-                        # mask_img = mask_img[..., 0]
-                    orig_imsize = self.parser.imsize_dict.get(name)
-                    if orig_imsize is not None:
-                        h0, w0 = orig_imsize
-                        factor = self.cfg.data_factor
-                        h1, w1 = h0 // factor, w0 // factor
-                    else:
-                        h1, w1 = height, width
 
-                    mask_img_resized = cv2.resize(mask_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
-                    # dilation to enlarge the mask
-                    kernel = np.ones((5, 5), np.uint8) 
-                    mask_img_resized = cv2.dilate(mask_img_resized, kernel, iterations=1)
-
-                    mask_tensor = torch.from_numpy(mask_img_resized).float() / 255.0
-                    mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(-1)
-                    # Additional resize if needed to match exact render resolution
-                    if mask_tensor.shape[1] != height or mask_tensor.shape[2] != width:
-                        mask_tensor = F.interpolate(mask_tensor.permute(0, 3, 1, 2), size=(height, width), mode='nearest')
-                        mask_tensor = mask_tensor.permute(0, 2, 3, 1) # [1,H,W,1]
-                    binary_mask = 1.0 -  mask_tensor.to(device) # 1 for background, 0 for dynamic object[1,H,W,1]
-
-            # train forward
             renders, alphas, info = self.rasterize_splats(
+            # train forward
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1519,22 +1015,13 @@ class Runner:
             imageio.imwrite(os.path.join(gt_train_dir,  name), gt_np)
             imageio.imwrite(os.path.join(rend_train_dir, name), rend_np)
 
-            # Copy mask file for saving (if mask was loaded)
-            if self.mask_dir and binary_mask is not None:
-                mpath = self.mask_dict.get(mask_name, None)
-                if mpath:
-                    mdst_dir = Path(self.cfg.result_dir) / "train" / "mask"
-                    mdst_dir.mkdir(parents=True, exist_ok=True)
-                    mdst = mdst_dir / mpath.name
-                    shutil.copy(mpath, mdst)
-
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
             info["means2d"].retain_grad()  # used for running stats
 
-            rgb_pred_mask = None 
+            rgb_pred_mask = None
 
             # loss
             if cfg.loss_type == "l1":
@@ -1542,193 +1029,123 @@ class Runner:
             else:
                 # robust loss
                 error_per_pixel = torch.abs(colors - pixels)
+                pred_mask = self.robust_mask(
+                    error_per_pixel, self.running_stats["avg_err"]
+                )
+                if cfg.semantics:
+                    sf = data["semantics"].to(device)
+                    if cfg.cluster:
+                        # cluster the semantic feature and mask based on cluster voting
+                        sf = nn.Upsample(
+                            size=(colors.shape[1], colors.shape[2]),
+                            mode="nearest",
+                        )(sf).squeeze(0)
+                        pred_mask = self.robust_cluster_mask(pred_mask, semantics=sf)
+                    else:
+                        # use spotless mlp to predict the mask
+                        sf = nn.Upsample(
+                            size=(colors.shape[1], colors.shape[2]),
+                            mode="bilinear",
+                        )(sf).squeeze(0)
+                        pos_enc = get_positional_encodings(
+                            colors.shape[1], colors.shape[2], 20
+                        ).permute((2, 0, 1))
+                        sf = torch.cat([sf, pos_enc], dim=0)
+                        sf_flat = sf.reshape(sf.shape[0], -1).permute((1, 0))
+                        self.spotless_module.eval()
+                        pred_mask_up = self.spotless_module(sf_flat)
+                        pred_mask = pred_mask_up.reshape(
+                            1, colors.shape[1], colors.shape[2], 1
+                        )
+                        # calculate lower and upper bound masks for spotless mlp loss
+                        lower_mask = self.robust_mask(
+                            error_per_pixel, self.running_stats["lower_err"]
+                        )
+                        upper_mask = self.robust_mask(
+                            error_per_pixel, self.running_stats["upper_err"]
+                        )
+                log_pred_mask = pred_mask.clone()
+                if cfg.schedule:
+                    # schedule sampling of the mask based on alpha
+                    alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
+                    pred_mask = torch.bernoulli(
+                        torch.clip(
+                            alpha + (1 - alpha) * pred_mask.clone().detach(),
+                            min=0.0,
+                            max=1.0,
+                        )
+                    )
+                rgbloss = (pred_mask.clone().detach() * error_per_pixel).mean()
+            ssimloss = 1.0 - self.ssim(
+                pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
+            )
+            # binary_mask: 연속 확률(가중치) 유지. 임계(threshold) 제거.
+            # 이후 동적/정적 판별이 필요한 곳(예: inpainting)은 연속값에 대해 <0.5 비교를 그대로 사용.
+            binary_mask = pred_mask.clone().detach().permute(0, 3, 1, 2)  # [B,1,H,W]
             
             # revised
             #--------------------------------------------------------------------------------------------------------------------------------------------
             if cfg.dino_loss_flag:
                 if not hasattr(self, "dino_extractor"):
                     self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
-                    # freeze DINO backbone parameters so we do not train the DINO model
-                    try:
-                        self.dino_extractor.dino_model.eval()
-                        for p in self.dino_extractor.dino_model.parameters():
-                            p.requires_grad = False
-                    except Exception:
-                        # defensive: some extractor implementations may differ
-                        pass
                 if not hasattr(self, "dino_head"):
                     # DINO 토큰(저해상도) -> 픽셀 해상도로 올리는 경량 업샘플 헤드
                     self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
-                    # we don't want to train the upsample head either (only splats should be updated)
-                    for p in self.dino_head.parameters():
-                        p.requires_grad = False
-                    self.dino_head.eval()
 
                 # self hard coded control
-                mask_adaptation = False
+                mask_adaptation = cfg.mask_adaptation
 
                 # 1) DINO 토큰 추출 (GT/Render)
                 gt_chw     = pixels.permute(0, 3, 1, 2)    # [B,3,H,W], GT
                 render_chw = colors.permute(0, 3, 1, 2)    # [B,3,H,W], 렌더 결과
 
-                if mask_adaptation and (binary_mask is not None):
-                    mask_chw = binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W], 마스크
-                    render_chw_safe = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw) # 마스크 영역은 렌더링 그래디언트가 안 흐르도록 처리
+                # The DINO model and upsampling head should be in eval mode and have gradients disabled.
+                # This is handled in the DinoFeatureExtractor constructor.
+                self.dino_extractor.dino_model.eval()
+                self.dino_head.eval()
 
-                # Extract GT tokens without gradient to save memory
+                # Prepare inputs for feature extraction
+                input_gt = gt_chw
+                input_render = render_chw
+
+                # Extract GT features with no_grad for efficiency
                 with torch.no_grad():
-                    ftok,  Th, Tw, _, _  = self.dino_extractor.extract_tokens(gt_chw)
+                    ftok, Th, Tw, _, _ = self.dino_extractor.extract_tokens(input_gt)
 
-                # Extract render tokens with gradient enabled so dino_loss can backprop to render pixels -> splats
-                if mask_adaptation and (binary_mask is not None):
-                    fhtok, Th2, Tw2, _, _  = self.dino_extractor.extract_tokens(render_chw_safe)
-                else:
-                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
+                # Extract render features with gradients enabled to flow back to splats
+                fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(input_render)
 
                 assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
                 B, _, C = ftok.shape
 
-                f_gt  = ftok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()   # [B,C,Th,Tw]
-                f_rnd = fhtok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()  # [B,C,Th,Tw]
+                f_gt = ftok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()
+                f_rnd = fhtok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()
 
                 # 2) 업샘플 → 이미지 해상도 정렬
                 ps = self.dino_extractor.patch_size
                 Hpad, Wpad = Th * ps, Tw * ps
 
-                f_gt_up_pad  = F.interpolate(self.dino_head(f_gt),  size=(Hpad, Wpad), mode="bilinear", align_corners=False)
+                with torch.no_grad():
+                    f_gt_up_pad = F.interpolate(self.dino_head(f_gt), size=(Hpad, Wpad), mode="bilinear", align_corners=False)
                 f_rnd_up_pad = F.interpolate(self.dino_head(f_rnd), size=(Hpad, Wpad), mode="bilinear", align_corners=False)
 
                 # 오른쪽/아래만 패딩했으므로 좌상단 기준으로 원 해상도(H,W)로 자르기
                 H, W = colors.shape[1], colors.shape[2]
-                f_gt_up  = f_gt_up_pad[:,  :, :H, :W]   # [B,C,H,W]
-                f_rnd_up = f_rnd_up_pad[:, :, :H, :W]   # [B,C,H,W]
-                
+                f_gt_up = f_gt_up_pad[:, :, :H, :W]
+                f_rnd_up = f_rnd_up_pad[:, :, :H, :W]
+
+
                 # 3) 코사인 불일치(=의미 차이) 맵 -> 배경(inlier) 영역에서만 정합 유도
-                cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]       
-                if mask_adaptation and (binary_mask is not None):
-                    dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
-                else:
-                    dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
+                cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]
+
+                # dino_feat_loss = (cosd).sum() / (stable_denominator + 1e-8)
+                dino_feat_loss = (cosd.sum()) / (binary_mask.sum() + 1e-8)
 
                 dino_loss =  dino_feat_loss
                 
             else:
                 dino_loss = 0.0
-            #--------------------------------------------------------------------------------------------------------------------------------------------
-#revised-1017
-            # this is not used do to unstable error backpropagation
-            # Todo: transient loss implementation
 
-            transient_loss = torch.tensor(0.0, device=device)
-
-            if cfg.transient_training_enable and binary_mask is not None and cfg.transient_loss_start_iter <= step and step % cfg.refine_every ==0:  # transient 활성화 조건
-                print("Transient loss computation is activated.")
-                # 1) 입력 텐서 준비 (DETACH): ConvDPT만 학습되도록 렌더 경로 차단
-                gt_chw_det     = gt_chw.detach()       # [B,3,H,W]
-                render_chw_det = render_chw.detach()   # [B,3,H,W]
-                transient_input = torch.cat((gt_chw_det, render_chw_det), dim=0)  # [2*B,3,H,W]
-
-                # 2) 공분산 파라미터 예측
-                # DINO extractor는 가중치 갱신/그래프 연결 불필요 → no_grad
-                with torch.no_grad():
-                    _ = self.dino_extractor  # 일부 구현에서 내부 상태 접근을 위해 참조 필요
-                transient_out = self.transient_model(transient_input, self.dino_extractor)
-
-                # transient_utils.ConvDPT returns Tensor [2*B, 3, H, W]
-                # convdpt_module.ConvDPT returns tuple/list: ([gt_sigma1,gt_sigma2,gt_rho],[s1,s2,r])
-                if isinstance(transient_out, torch.Tensor):
-                    cov = transient_out
-                    B2 = gt_chw_det.shape[0]
-                    cov_gt = cov[:B2]
-                    cov_render = cov[B2 : B2 * 2]
-
-                    sigma_1 = cov_gt[:, 0]
-                    sigma_2 = cov_gt[:, 1]
-                    rho     = cov_gt[:, 2]
-
-                    s_1 = cov_render[:, 0]
-                    s_2 = cov_render[:, 1]
-                    r   = cov_render[:, 2]
-                else:
-                    transient_maps = transient_out
-                    sigma_1 = transient_maps[0][0]  # [B, H, W]
-                    sigma_2 = transient_maps[0][1]  # [B, H, W]  
-                    rho     = transient_maps[0][2]  # [B, H, W]
-
-                    s_1 = transient_maps[1][0]  # [B, H, W]
-                    s_2 = transient_maps[1][1]  # [B, H, W]
-                    r   = transient_maps[1][2]  # [B, H, W]
-                
-                # 수치 안전화 (양쪽 determinant/분산 모두 clamp)
-                eps = 1e-6
-                det        = torch.clamp(sigma_1.square() * sigma_2.square() * (1.0 - rho.square()), min=eps)
-                det_render = torch.clamp(s_1.square()     * s_2.square()     * (1.0 - r.square()  ), min=eps)
- 
-                 # 4) KL divergence 계산
-
-                # 3) DSSIM 공간 맵 계산 (논문과 동일)
-                ssim_map = self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
-                dssim_map = (1.0 - ssim_map) / 2.0  # [B, H, W]
-
-                # 4) KL divergence 계산
-                KL = ((sigma_1.square() / torch.clamp(s_1.square(), min=eps)
-                    + sigma_2.square() / torch.clamp(s_2.square(), min=eps)
-                    - rho * r * sigma_1 * sigma_2 / torch.clamp(s_1 * s_2, min=eps)) / torch.clamp(1.0 - rho.square(), min=eps)
-                    - torch.log(det / det_render) - 2) * 0.5
-
-                # 5) likelihood (negative log-likelihood)
-                # d_cos와 dssim_map은 detach하여 transient 모델만 학습
-                likelihood = (1 / torch.clamp(1.0 - rho.square(), min=eps)) * (
-                    cosd.squeeze(1).detach().square() / torch.clamp(sigma_1.square(), min=eps) +
-                    dssim_map.detach().square() / torch.clamp(sigma_2.square(), min=eps) -
-                    2 * cosd.squeeze(1).detach() * dssim_map.detach() * rho / torch.clamp(sigma_1 * sigma_2, min=eps)
-                ) + torch.log(det)
-
-                # 6) per-pixel 에너지 맵
-                transient_energy = KL + likelihood  # [B, H, W]
-                transient_energy = torch.nan_to_num(transient_energy, nan=0.0, posinf=10.0, neginf=0.0)
-
-                # 7) (옵션) KL 기반 마스크 생성 및 photometric 손실에 적용 (논문 방식)
-                # KL_threshold, dilate_exp, schedule_beta 등 하이퍼파라미터 필요
-                # 예시:
-                # transient_mask = transient_energy.clone().detach()
-                # transient_mask = dilate_mask(transient_mask, opt_dilate_exp)
-                # mask = torch.where(transient_mask < opt_KL_threshold, 1, 0)
-                # alpha = np.exp(opt_schedule_beta * np.floor((1 + step) / 1.5))
-                # mask = torch.bernoulli(torch.clip(alpha + (1 - alpha) * mask, min=0.0, max=1.0))
-                # mask = mask.detach()
-                # photometric_loss = torch.mean(diff * mask)
-
-                # 8) 전체 평균으로 스칼라화
-                transient_loss = transient_energy.mean()
-                transient_loss_weighted = transient_loss
-
-
-                #revised-1017               
-                self.transient_optimizer.zero_grad()
-                # 여기서 사용하는 transient_loss는 위에서 DETACH 입력으로 계산된 것
-                transient_loss.backward()     # ConvDPT 파라미터에만 gradient
-                self.transient_optimizer.step()
-                if self.transient_scheduler is not None:
-                    self.transient_scheduler.step()
-            else:
-                transient_loss_weighted = 0.0 
-
-
-#--------------------------------------------------------------------------------------------------------------------------------------------
-
-            #revised
-            # cosine scheduling for ssim_lambda and compose the photometric loss
-            if binary_mask is not None:
-                curr_ssim_lambda = self.get_ssim_lambda(step)
-
-                # loss definition
-                rgbloss = (binary_mask * error_per_pixel).sum() / (binary_mask.sum()*3 + 1e-8)
-                # ssim loss
-                # ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
-                # do not use because it allocates a lot of memories (16GB)
-                ssimloss = 1.0 - self.masked_ssim(pixels.permute(0,3,1,2), colors.permute(0,3,1,2), binary_mask.permute(0,3,1,2)) # take all into B C H W
-                
             #depth loss (experimental)
             if cfg.depth_loss:
                 # query depths from depth map
@@ -1748,105 +1165,14 @@ class Runner:
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+            else:
+                depthloss = 0.0
 
 #revised-1013
             # ---------------- Self-Ensemble: pseudo-view render↔render loss ----------------
             se_coreg = torch.tensor(0.0, device=device)
-            # 디버그: se_coreg 진입 조건 확인용 (train 루프 안, 조건문 바로 위)
-    
-            if (self.cfg.se_coreg_enable and binary_mask is not None and cfg.refine_start_iter < step and step % cfg.se_coreg_refine_every == 0
-            ):
-            
-            # and cfg.se_coreg_start_iter < step
-                #: implement pseudo view selection strategy
-                # to use spotless-mlp classifier pixelwise model trained with binary mask and use that for pseudo view dynamic mask.
-
-
-                # (1) Make pseudo views (may return multiple views). Limit to two
-                # pv_c2w, pv_K = self._make_pseudo_views(camtoworlds, Ks, self.cfg.se_pseudo_K)
-
-                # # Ensure torch tensors on device
-                # if isinstance(pv_c2w, np.ndarray):
-                #     pv_c2w_t = torch.from_numpy(pv_c2w).float().to(device)
-                # else:
-                #     pv_c2w_t = pv_c2w
-
-                # if isinstance(pv_K, np.ndarray):
-                #     pv_K_t = torch.from_numpy(pv_K).float().to(device)
-                # else:
-                #     pv_K_t = pv_K
-
-                # if pv_c2w_t.shape[0] < 2:
-                #     se_coreg_loss = 0.0
-                # else:
-                #     pv_c2w_use = pv_c2w_t[:2]
-                #     pv_K_use = pv_K_t[:2]
-
-                    # # convert mask dims safely (used in other parts if needed)
-                    # if binary_mask.shape == (1, height, width, 1):
-                    #     dyn_mask = binary_mask.squeeze(-1)
-                    # else:
-                    #     dyn_mask = binary_mask.permute(0, 3, 1, 2).squeeze(1)
-
-                    # # decide which Gaussians to reset using first pseudo view info
-                    # with torch.no_grad():
-                    #     _, _, info_pv0 = self.rasterize_splats(
-                    #         camtoworlds=pv_c2w_use[0:1],
-                    #         Ks=pv_K_use[0:1],
-                    #         width=width,
-                    #         height=height,
-                    #         sh_degree=sh_degree_to_use,
-                    #         near_plane=cfg.near_plane,
-                    #         far_plane=cfg.far_plane,
-                    #     )
-                    # reset_mask_pv = self._find_reset_gaussians_by_mask(dyn_mask, info_pv0)
-
-                    # # (2) Render sigma (background) under no_grad to avoid storing activations
-                    # with self._temporary_splats(self._clone_splats()):
-                    #     # fully reset dynamic gaussians for background render
-                    #     # self._apply_reset_attributes(reset_mask_pv, 0.0)
-                    #     with torch.no_grad():
-                    #         sigma_imgs, _, _ = self.rasterize_splats(
-                    #             camtoworlds=pv_c2w_use,
-                    #             Ks=pv_K_use,
-                    #             width=width,
-                    #             height=height,
-                    #             sh_degree=sh_degree_to_use,
-                    #             near_plane=cfg.near_plane,
-                    #             far_plane=cfg.far_plane,
-                    #         )
-                    #         sigma_imgs = torch.clamp(sigma_imgs, 0.0, 1.0)
-
-                    # # (3) Render delta (background + small perturb) with gradients enabled
-                    # delta_splats = self._clone_splats()
-                    # with self._temporary_splats(delta_splats):
-                    #     self._apply_reset_attributes(reset_mask_pv, self._uap_noise_ratio(step))
-                    #     delta_imgs, _, _ = self.rasterize_splats(
-                    #         camtoworlds=pv_c2w_use,
-                    #         Ks=pv_K_use,
-                    #         width=width,
-                    #         height=height,
-                    #         sh_degree=sh_degree_to_use,
-                    #         near_plane=cfg.near_plane,
-                    #         far_plane=cfg.far_plane,
-                    #     )
-                    #     delta_imgs = torch.clamp(delta_imgs, 0.0, 1.0)
-
-                    # (4) Compute photometric loss between background-only sigma and perturbed delta.
-                    # Use detach on sigma_imgs (was computed with no_grad()) to be explicit.
-                    # se_coreg = F.l1_loss(sigma_imgs.detach(), delta_imgs.detach())
-                    # se_coreg_loss = se_coreg
-
-
-                ### already exist camera view with delta perturbation model
-
-
-                if binary_mask.shape == (1, height, width, 1):
-                        dyn_mask = binary_mask.squeeze(-1)
-                else:
-                    dyn_mask = binary_mask.permute(0, 3, 1, 2).squeeze(1)
-                
+      
+            if cfg.se_coreg_enable and step > cfg.refine_start_iter and step % cfg.se_coreg_refine_every ==0 :
                 # Render sigma (background) under no_grad to avoid storing activations
                 # Request packed mode so the renderer fills per-pixel gaussian ids in `info`.
                 with self._temporary_splats(self._clone_splats()):
@@ -1865,7 +1191,7 @@ class Runner:
                     sigma_imgs = torch.clamp(renders, 0.0, 1.0)
                 
                 # Use the packed-render info (which includes 'gaussian_ids') to find reset gaussians
-                reset_mask_pv = self._find_reset_gaussians_by_mask(dyn_mask, info_sigma, cameras=camtoworlds)
+                reset_mask_pv = self._find_reset_gaussians_by_mask(binary_mask, info_sigma, cameras=camtoworlds)
 
                 # Render delta (background + small perturb) with gradients enabled
                 delta_splats = self._clone_splats()
@@ -1891,21 +1217,11 @@ class Runner:
                 # Use detach on sigma_imgs (was computed with no_grad()) to be explicit.
                 se_coreg = F.l1_loss(sigma_imgs, delta_imgs.detach())
                 se_coreg_loss = se_coreg
-
-
             else:
                 se_coreg_loss = 0.0
 
-            #need scheduler
-            lambda_p = self.get_ssim_lambda(step)
-            #total loss
-            # loss = rgbloss * (1.0 - curr_ssim_lambda) + (ssimloss * curr_ssim_lambda) + (f * cfg.dino_lambda) + (transient_loss * cfg.transient_lambda) + (self.cfg.se_coreg_lambda * se_coreg_loss)
-            # loss = rgbloss * (1.0 - lambda_p) + (lambda_p * se_coreg_loss) + (dino_loss *(lambda_p)) + (transient_loss * lambda_p)
-            # loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda ) * (1.0 - lambda_p)  + (transient_loss * lambda_p)  
-
-                
             # total loss            
-            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda*0.01 ) + se_coreg_loss *cfg.se_coreg_lambda + transient_loss_weighted * lambda_p
+            loss = ( rgbloss  + dino_loss *cfg.dino_loss_lambda*0.01 ) + se_coreg_loss *cfg.se_coreg_lambda
             if step % cfg.refine_every ==0 :
                 print (  f"Step {step}: rgbloss={rgbloss.item():.6f}, dino_loss={dino_loss.item() if torch.is_tensor(dino_loss) else dino_loss:.6f}, se_coreg_loss={se_coreg_loss.item() if torch.is_tensor(se_coreg_loss) else se_coreg_loss:.6f} ")
 
@@ -1913,6 +1229,22 @@ class Runner:
 # ----------------------------------------------------------------------------------------------------------------------------
 
             loss.backward()
+
+            if self.mlp_spotless:
+                self.spotless_module.train()
+                spot_loss = self.spotless_loss(
+                    pred_mask_up.flatten(), upper_mask.flatten(), lower_mask.flatten()
+                )
+                reg = 0.5 * self.spotless_module.get_regularizer()
+                spot_loss = spot_loss + reg
+                spot_loss.backward()
+
+            # Pass the error histogram for capturing error statistics
+            info["err"] = torch.histogram(
+                torch.mean(torch.abs(colors - pixels), dim=-1).clone().detach().cpu(),
+                bins=cfg.bin_size,
+                range=(0.0, 1.0),
+            )[0]
 
 
             desc = f"loss={loss.item():.9f}| " f"sh degree={sh_degree_to_use}| "
@@ -1934,8 +1266,6 @@ class Runner:
                 #------------------------------------------------------------------------------------------------------------------------
                 self.writer.add_scalar("train/rgbloss", rgbloss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                if transient_loss > 0:
-                    self.writer.add_scalar("train/transient_loss", transient_loss.item(), step)
                 self.writer.add_scalar(
                     "train/num_GS", len(self.splats["means3d"]), step
                 )
@@ -1982,86 +1312,7 @@ class Runner:
                         f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
                         f"Now having {len(self.splats['means3d'])} GSs."
                     )
-                    
-#revised-1015---------------------------------------------------------------------------------------------------
-                    # # test camera pose들에 대한 pseudo view 생성 및 저장
-                    # # Trajectory의 초반과 후반부 카메라 포즈 생성
-                    # if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter and step % cfg.refine_every == 0:
-                    #     print("Generating trajectory start and end poses for pseudo views...")
-
-                    #     # parser에서 직접 카메라 포즈 가져오기
-                    #     K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-                    #     camtoworlds = get_ordered_poses(self.parser.camtoworlds)
-                    #     camtoworlds = torch.from_numpy(camtoworlds).float().to(device)  # [N, 4, 4]
-
-
-                    
-                    #     # 전체 카메라 수의 20%를 초반과 후반에서 각각 선택
-                    #     n_views = len(camtoworlds)
-                    #     n_select = max(1, int(n_views * 0.2))  # 최소 1개는 선택
-
-                    #     # 초반부와 후반부 카메라 포즈 선택
-                    #     start_poses = camtoworlds[:n_select]  # 처음 20%
-                    #     end_poses = camtoworlds[-n_select:]   # 마지막 20%
-
-                    #     # 선택된 포즈들 결합
-                    #     selected_poses = torch.cat([start_poses, end_poses], dim=0)  # [2*n_select, 4, 4]
-                    #     selected_Ks = K.unsqueeze(0).repeat(len(selected_poses), 1, 1)  # [2*n_select, 3, 3]
-
-            
-                    #     # 각 선택된 포즈에 대해 K개의 pseudo view 생성
-                    #     pseudo_camtoworlds, pseudo_Ks = self._make_pseudo_views(
-                    #         selected_poses, 
-                    #         selected_Ks, 
-                    #         self.cfg.se_pseudo_K
-                    #     )
-
-                    #     # tag visiblity per gaussians
-                    #     # Initialize Gaussian tracking
-                    #     num_gaussians = len(self.splats["means3d"])
-                    #     gaussian_render_counts = torch.zeros(num_gaussians, device=device)
-
-                    #     # Render each pseudo view
-                    #     for i in range(len(pseudo_camtoworlds)):
-                    #         # Get camera parameters for this pseudo view
-                    #         curr_c2w = pseudo_camtoworlds[i:i+1]  # [1, 4, 4]
-                    #         curr_K = pseudo_Ks[i:i+1]  # [1, 3, 3]
-                            
-                    #         # Render the view
-                    #         _, _, info = self.rasterize_splats(
-                    #             camtoworlds=curr_c2w,
-                    #             Ks=curr_K,
-                    #             width=width,
-                    #             height=height,
-                    #             sh_degree=cfg.sh_degree,
-                    #             near_plane=cfg.near_plane,
-                    #             far_plane=cfg.far_plane,
-                    #             packed=True  # Ensure we get gaussian_ids
-                    #         )
-                            
-                    #         # Track which Gaussians were used in this view
-                    #         if "gaussian_ids" in info:
-                    #             gaussian_ids = info["gaussian_ids"].long()  # [nnz]
-                    #             if gaussian_ids is not None and gaussian_ids.numel() > 0:
-                    #                 gaussian_render_counts.index_add_(
-                    #                     0, 
-                    #                     gaussian_ids, 
-                    #                     torch.ones_like(gaussian_ids, dtype=torch.float)
-                    #                 )
-                    
-                    #     # Normalize counts to get percentage of views each Gaussian appears in
-                    #     total_views = len(pseudo_camtoworlds)
-                    #     gaussian_visibility_ratio = gaussian_render_counts / total_views  # [num_gaussians]
-                        
-                    #     #if gaussian_visibility_ratio is less than threshold, decay their opacity
-                    #     low_visibility_mask = gaussian_visibility_ratio < cfg.gaussian_visibility_thresh
-                    #     if low_visibility_mask.any():
-                    #         # Use _decay_opacity function with stronger decay 
-                    #         self._decay_opacity(low_visibility_mask, factor=0.005)
-                    #         print(f"Adjusted opacity for {low_visibility_mask.sum().item()} low-visibility Gaussians")
-                    
-
-#---------------------------------------------------------------------------------------------------------------------
+ 
                     # prune GSs
                     is_prune = torch.sigmoid(self.splats["opacities"]) < cfg.prune_opa                
                     if step > cfg.reset_every:
@@ -2074,92 +1325,6 @@ class Runner:
                         )
                         is_prune = is_prune | is_too_big
                         
-#revised-1015-1024 ---------------------------------------------------------------------------------------------------
-# Prune Gaussians too close to trajectory cameras (매번 다른 궤적 사용)
-                    if cfg.start_pseudo_view_iter > 0 and step >= cfg.start_pseudo_view_iter and step % cfg.refine_every == 0:
-                        # 1) Get ordered camera poses
-                        prune_camtoworlds = get_ordered_poses(self.parser.camtoworlds)
-                        
-                        # 2) 매번 다른 샘플링 오프셋 사용 (시간에 따라 변화)
-                        # step에 따라 샘플링 시작점을 순환 (0~19)
-                        offset = (step // cfg.refine_every) % 20
-                        
-                        # 3) 무작위 섭동 추가 (작은 노이즈로 다양한 궤적 생성)
-                        np.random.seed(step)  # step 기반 시드로 재현 가능하지만 매번 다름
-                        # 샘플링된 키프레임 선택 (오프셋 적용)
-                        keyframe_indices = np.arange(offset, len(prune_camtoworlds), 20)
-                        keyframes = prune_camtoworlds[keyframe_indices].copy()
- 
-                        prune_camtoworlds = generate_interpolated_path(
-                            keyframes, 40, spline_degree=1, smoothness=0.3
-                        )  # [N, 3, 4]
-                        
-                        # 5) 무작위 스케일 변화 추가 (0.9~1.2 범위)
-                        scale_variation = 0.9 + 0.3 * np.random.rand()  # 매번 다른 스케일
-                        
-                        # 6) Add homogeneous coordinates
-                        prune_camtoworlds = np.concatenate(
-                            [
-                                prune_camtoworlds,
-                                np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(prune_camtoworlds), axis=0),
-                            ],
-                            axis=1,
-                        )  # [N, 4, 4]
-                        # Choose up to K trajectory cameras (reduces randomness vs single random camera)
-                        K = min(8, len(prune_camtoworlds)) if len(prune_camtoworlds) > 0 else 0
-                        if K == 0:
-                            # nothing to do
-                            continue
-
-                        # pick K indices spaced across the path for diversity
-                        if len(prune_camtoworlds) <= K:
-                            sampled = prune_camtoworlds
-                        else:
-                            # evenly spaced selection + small random offset
-                            idxs = np.linspace(0, len(prune_camtoworlds) - 1, K, dtype=int)
-                            sampled = prune_camtoworlds[idxs]
-
-                        # 7) Apply dynamic scale to sampled cameras
-                        scale_factor = 1.1 * scale_variation
-                        sampled = sampled * np.reshape(
-                            np.array([[scale_factor, scale_factor, scale_factor, 1.0]]), (1, 4, 1)
-                        )
-
-                        # 8) Convert sampled cameras to torch tensor
-                        prune_camtoworlds_t = torch.from_numpy(sampled).float().to(device)  # [K,4,4]
-
-                        # Compute minimum distance from each Gaussian to any sampled camera
-                        means3d = self.splats["means3d"]  # [num_gaussians, 3]
-                        cam_positions = prune_camtoworlds_t[:, :3, 3]  # [K,3]
-                        # torch.cdist returns [G, K]
-                        dists = torch.cdist(means3d, cam_positions)  # [G, K]
-                        min_dists = dists.min(dim=1)[0]
-
-                        is_2close = min_dists < (0.1 * self.scene_scale)  # threshold configurable
-                        is_prune = is_prune | is_2close
-                        print(f"  -> [Offset:{offset}, Scale:{scale_variation:.2f}] Sampled {K} cams; marked {is_2close.sum().item()} Gaussians too close to trajectory cameras for pruning")
-#-----------------------------------------------------------------------------------------------------
-#revised-1016       # ========== 새로운 Floater Detection 알고리즘들 ==========  after dynamic pruen start iter
-                    # 1. Depth-based floater detection 
-                        # dyn_mask_2d = binary_mask.squeeze(-1) if binary_mask.dim() == 4 else binary_mask
-                        # depth_floaters = self._detect_depth_inconsistent_gaussians(
-                        #     curr_c2w, curr_K, width, height, dyn_mask_2d, depth_threshold=cfg.depth_floater_thresh #take pseudo view camera to this.
-                        # )
-                        # if depth_floaters.any():
-                        #     is_prune = is_prune | (is_2close & depth_floaters)
-                        #     print(f"  -> Marked {depth_floaters.sum().item()} depth-inconsistent floaters")
-                    
-                    
-                    # 2. Inpaint dynamic regions (후기에만, pruning 후)
-                    if (cfg.enable_dynamic_inpainting and step >= cfg.dynamic_prune_start_iter):
-                        if step % cfg.refine_every == 0:
-                            print("[Ghost Fix] Inpainting dynamic regions...")
-                            n_inpainted = self._inpaint_dynamic_regions(
-                                binary_mask, camtoworlds, inpaint_strength=1.0
-                            )
-                            if n_inpainted > 0:
-                                print(f"  -> Inpainted {n_inpainted} background Gaussians into dynamic regions")
-                    # ====================================================
 #-----------------------------------------------------------------------------------------------------------
                     
                     if cfg.ubp:
@@ -2233,8 +1398,11 @@ class Runner:
             # Save the mask image with gt -renders
             if step > max_steps - 200 and cfg.semantics:
                 st_interval = time.time()
-                rgb_pred_mask = (binary_mask.repeat(1, 1, 1, 3).clone().detach())
-
+                # binary_mask는 [B, C, H, W] 형태이므로 [B, H, W, C]로 변환
+                # rgb_pred_mask = binary_mask.permute(0, 2, 3, 1).repeat(1, 1, 1, 3).clone().detach()
+                rgb_pred_mask = (
+                    (log_pred_mask > 0.5).repeat(1, 1, 1, 3).clone().detach()
+                )
                 canvas = (
                     torch.cat([pixels, rgb_pred_mask, colors], dim=2)
                     .squeeze(0)
@@ -2532,7 +1700,7 @@ class Runner:
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
         ellipse_time = 0
-        metrics = {"psnr": [], "ssim": [], "lpips": [], "MASK_psnr": [], "MASK_ssim": [], "MASK_lpips": []}
+        metrics = {"psnr": [], "ssim": [], "lpips": []}
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -2544,58 +1712,6 @@ class Runner:
                 filename = filename[0]
             base = Path(filename).stem
             name = base.replace("_extra", "").replace("_clutter", "") + ".png"
-            test_mask_name = base.replace("_extra", "").replace("_clutter", "")
-        
-
-            #revised 0910
-            # test mask saved
-            test_binary_mask = None
-
-            if self.mask_dir:
-                mpath = self.mask_dict.get(test_mask_name, None)
-                test_mdst_dir = Path(self.cfg.result_dir) / "test" / "mask"
-                test_mdst_dir.mkdir(parents=True, exist_ok=True)
-                if mpath:
-                    mdst = test_mdst_dir / mpath.name
-                    shutil.copy(mpath, mdst)
-                else:
-                    raise FileNotFoundError(f"Mask not found for '{test_mask_name}' in mask_dir.")
-
-                # mask load and process
-                test_mask_img = imageio.imread(mpath)
-                if test_mask_img.ndim == 3:
-                    print("[WARN] mask image has 3 channels, converting to grayscale")
-                    # test_mask_img = test_mask_img[..., 0]
-
-                orig_imsize = self.parser.imsize_dict.get(name)
-                if orig_imsize is not None:
-                    h0, w0 = orig_imsize
-                    factor = self.cfg.data_factor
-                    h1, w1 = h0 // factor, w0 // factor
-                else:
-                    h1, w1 = height, width
-                test_mask_img_resized = cv2.resize(test_mask_img, (w1, h1), interpolation=cv2.INTER_NEAREST)
-
-                # dilation 적용
-                kernel = np.ones((5, 5), np.uint8)  # 커널 크기를 조절해서 enlarge 정도를 변경
-                test_mask_img_resized = cv2.dilate(test_mask_img_resized, kernel, iterations=1)
-
-                test_mask_tensor = torch.from_numpy(test_mask_img_resized).float() / 255.0
-                test_mask_tensor = test_mask_tensor.unsqueeze(0).unsqueeze(-1)
-                
-                if test_mask_tensor.shape[1] != h1 or test_mask_tensor.shape[2] != w1:
-                    test_mask_tensor = F.interpolate(test_mask_tensor.permute(0, 3, 1, 2), size=(colors.shape[1], colors.shape[2]), mode='nearest')
-                    test_mask_tensor = test_mask_tensor.permute(0, 2, 3, 1)
-                    
-                test_binary_mask = test_mask_tensor.to(device)
-
-                test_binary_mask = test_binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W]
-
-                test_binary_mask = 1.0 - test_binary_mask  # 1 for background, 0 for foreground
-                # print("test_binary_mask unique:", torch.unique(test_binary_mask))
-                # print("test_binary_mask mean:", test_binary_mask.mean())
-                # print("test_binary_mask shape:", test_binary_mask.shape)
-
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -2628,29 +1744,10 @@ class Runner:
             metrics["psnr"].append(self.psnr(colors, pixels))
             metrics["ssim"].append(self.ssim(colors, pixels))
             metrics["lpips"].append(self.lpips(colors, pixels))
-            
-            # test metrics with mask applied
-            metrics["MASK_psnr"].append(self.masked_psnr(colors, pixels, test_binary_mask))
-            metrics["MASK_ssim"].append(self.masked_ssim(colors, pixels, test_binary_mask).mean())     
-            comp_pred = test_binary_mask * colors + (1 - test_binary_mask) * pixels
-            comp_gt   = pixels
-            metrics["MASK_lpips"].append(self.lpips(comp_pred, comp_gt))
-
-
-
-        masked_psnr = torch.stack(metrics["MASK_psnr"]).mean()
-        masked_ssim = torch.stack(metrics["MASK_ssim"]).mean()
-        masked_lpips = torch.stack(metrics["MASK_lpips"]).mean()
 
         ellipse_time /= len(valloader)
 
-        print("")
-        print("[EVAL] TEST rendered image WITH MASK metrics")
-        print(
-            f"MASK_PSNR: {masked_psnr.item():.9f}, MASK_SSIM: {masked_ssim.item():.9f}, MASK_LPIPS: {masked_lpips.item():.9f} "
-            f"Time: {ellipse_time:.9f}s/image "
-            f"Number of GS: {len(self.splats['means3d'])}"
-            )    
+   
 
         psnr = torch.stack(metrics["psnr"]).mean()
         ssim = torch.stack(metrics["ssim"]).mean()
