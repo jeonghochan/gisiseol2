@@ -39,6 +39,9 @@ from gsplat.rendering import rasterization
 from dino_utils import DinoFeatureExtractor, DPT_Head, DinoUpsampleHead, ConvDPT
 # from transient_utils import ConvDPT
 
+#for feature map save
+# import imageio.v2 as imageio
+# from sklearn.decomposition import PCA
 
 
 @dataclass
@@ -132,7 +135,7 @@ class Config:
 
     # Start refining GSs after this iteration
     # Stop refining GSs after this iteration
-    refine_start_iter: int = 100
+    refine_start_iter: int = 500 #100
     refine_stop_iter: int = 20000 # tag
     # Reset opacities every this steps
     reset_every: int = 300000
@@ -188,7 +191,7 @@ class Config:
     #mask directory
     mask_dir: Optional[str] = None
     #someday to change 
-    # seed : int = 42
+    seed : int = 42
     pseudo_gt_dir: Optional[str] = None  # temporary directory for pseudo GT
 
     # Weight for MLP mask loss
@@ -196,6 +199,7 @@ class Config:
     # Weight for DINO feature loss
     dino_loss_flag: bool = True
     dino_loss_lambda: float = 0.2 #tag
+    mask_adaptation: bool = False
     
 
     #parameter for self-ensemble-revised-1013
@@ -210,7 +214,7 @@ class Config:
 
     se_coreg_enable: bool = True
     se_coreg_start_iter: int = 7000
-    se_coreg_lambda: float = 0.1#0.5
+    se_coreg_lambda: float = 0.1
     se_pseudo_K: int = 2                    # pseudo view 개수
     se_coreg_refine_every: int = 100    # self-ensemble 
     # fallback jitter (cameras.PseudoCamera 미사용시)
@@ -242,6 +246,10 @@ class Config:
     # Minimum age (in training steps) before a newly created Gaussian can be
     # pruned. Helps avoid immediate prune after duplication/splitting.
     min_age_before_prune: int = 150
+
+    #revised11-18
+    # Learning rate warmup steps
+    lr_warmup_steps: int = 1000
 
   
 
@@ -345,8 +353,7 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(self, cfg: Config) -> None:
-        set_random_seed(42)
-
+        set_random_seed(cfg.seed)
         self.cfg = cfg
         self.device = "cuda"
 
@@ -901,6 +908,40 @@ class Runner:
         # print("uap noise ration fucn works")
         return self.cfg.uap_noise_init + (self.cfg.uap_noise_final - self.cfg.uap_noise_init) * t
     
+    # @torch.no_grad()
+    # def visualize_features_pca(self, features_tensor: torch.Tensor) -> np.ndarray:
+    #     """
+    #     DINO 특징 맵(B, C, H, W)을 PCA를 사용해 (H, W, 3) RGB 이미지로 변환합니다.
+    #     """
+    #     # 1. 텐서 준비 (B=1 가정)
+    #     # [1, C, H, W] -> [C, H, W]
+    #     features = features_tensor.squeeze(0).float()
+        
+    #     # 2. PCA를 위한 형태 변경
+    #     # [C, H, W] -> [H, W, C]
+    #     features = features.permute(1, 2, 0)
+    #     h, w, c = features.shape
+        
+    #     # [H, W, C] -> [H*W, C] (PCA 입력 형태)
+    #     features_flat = features.reshape(-1, c).cpu().numpy()
+
+    #     # 3. PCA 실행 (n_components=3 : RGB)
+    #     # 매번 fit을 다시 계산하여 현재 특징의 주성분을 찾음
+    #     pca = PCA(n_components=3)
+    #     pca_features = pca.fit_transform(features_flat) # [H*W, 3]
+
+    #     # 4. 이미지로 정규화
+    #     # 각 채널(주성분)별로 0~1 사이로 Min-Max 스케일링
+    #     pca_min = pca_features.min(axis=0)
+    #     pca_max = pca_features.max(axis=0)
+    #     pca_features_norm = (pca_features - pca_min) / (pca_max - pca_min + 1e-6)
+        
+    #     # 5. 최종 이미지 형태로 변환
+    #     # [H*W, 3] -> [H, W, 3]
+    #     pca_image = (pca_features_norm * 255).astype(np.uint8)
+    #     pca_image = pca_image.reshape(h, w, 3)
+
+    #     return pca_image
 
     @torch.no_grad()
     def _make_pseudo_views(self, camtoworlds: Tensor, Ks: Tensor, K: int) -> Tuple[Tensor, Tensor]:
@@ -1377,22 +1418,81 @@ class Runner:
         with open(f"{cfg.result_dir}/cfg.json", "w") as f:
             json.dump(vars(cfg), f)
 
+        # max_steps = cfg.max_steps
+        # init_step = 0
+
+        # schedulers = [
+        #     # means3d has a learning rate schedule, that end at 0.01 of the initial value
+        #     torch.optim.lr_scheduler.ExponentialLR(
+        #         self.optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+        #     ),
+        # ]
+        # if cfg.pose_opt:
+        #     # pose optimization has a learning rate schedule
+        #     schedulers.append(
+        #         torch.optim.lr_scheduler.ExponentialLR(
+        #             self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+        #         )
+        #     )
+
+        #revised 11-18
         max_steps = cfg.max_steps
         init_step = 0
 
-        schedulers = [
-            # means3d has a learning rate schedule, that end at 0.01 of the initial value
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers[0], gamma=0.01 ** (1.0 / max_steps)
-            ),
-        ]
+        # --- LR 웜업 스케줄러 로직 시작 ---
+        schedulers = []
+        
+        # 웜업 후 실제 감속(decay)이 일어날 스텝 수 계산
+        main_decay_steps = max(1, max_steps - cfg.lr_warmup_steps)
+
+        # 1. 메인 옵티마이저 (means3d 등) 스케줄
+        optimizer_main = self.optimizers[0]
+        
+        # 웜업 스케줄러 (예: 0.01배 LR -> 1.0배 LR)
+        warmup_scheduler_main = torch.optim.lr_scheduler.LinearLR(
+            optimizer_main,
+            start_factor=0.01, # 웜업 시작 시 LR 배율
+            end_factor=1.0,
+            total_iters=cfg.lr_warmup_steps
+        )
+        
+        # 메인 감속 스케줄러 (기존 ExponentialLR)
+        decay_scheduler_main = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer_main, 
+            gamma=0.01 ** (1.0 / main_decay_steps) # 웜업 이후 스텝에 대해서만 감속
+        )
+        
+        # 두 스케줄러를 순차적으로 연결
+        sequential_scheduler_main = torch.optim.lr_scheduler.SequentialLR(
+            optimizer_main,
+            schedulers=[warmup_scheduler_main, decay_scheduler_main],
+            milestones=[cfg.lr_warmup_steps] # 웜업 스텝 이후에 decay_scheduler_main으로 전환
+        )
+        schedulers.append(sequential_scheduler_main)
+
+        # 2. 포즈 옵티마이저 (pose_opt) 스케줄 (활성화된 경우)
         if cfg.pose_opt:
-            # pose optimization has a learning rate schedule
-            schedulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
-                )
+            optimizer_pose = self.pose_optimizers[0]
+            
+            warmup_scheduler_pose = torch.optim.lr_scheduler.LinearLR(
+                optimizer_pose,
+                start_factor=0.01,
+                end_factor=1.0,
+                total_iters=cfg.lr_warmup_steps
             )
+            
+            decay_scheduler_pose = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer_pose, 
+                gamma=0.01 ** (1.0 / main_decay_steps) # 동일한 스텝 수 적용
+            )
+            
+            sequential_scheduler_pose = torch.optim.lr_scheduler.SequentialLR(
+                optimizer_pose,
+                schedulers=[warmup_scheduler_pose, decay_scheduler_pose],
+                milestones=[cfg.lr_warmup_steps]
+            )
+            schedulers.append(sequential_scheduler_pose)
+        # --- LR 웜업 스케줄러 로직 끝 ---
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
@@ -1548,68 +1648,102 @@ class Runner:
             if cfg.dino_loss_flag:
                 if not hasattr(self, "dino_extractor"):
                     self.dino_extractor = DinoFeatureExtractor(getattr(cfg, "dino_version", "dinov2_vits14"))
-                    # freeze DINO backbone parameters so we do not train the DINO model
-                    try:
-                        self.dino_extractor.dino_model.eval()
-                        for p in self.dino_extractor.dino_model.parameters():
-                            p.requires_grad = False
-                    except Exception:
-                        # defensive: some extractor implementations may differ
-                        pass
                 if not hasattr(self, "dino_head"):
                     # DINO 토큰(저해상도) -> 픽셀 해상도로 올리는 경량 업샘플 헤드
                     self.dino_head = DinoUpsampleHead(self.dino_extractor.dino_model.embed_dim).to(self.device)
-                    # we don't want to train the upsample head either (only splats should be updated)
-                    for p in self.dino_head.parameters():
-                        p.requires_grad = False
-                    self.dino_head.eval()
 
                 # self hard coded control
-                mask_adaptation = False
+                mask_adaptation = cfg.mask_adaptation
 
                 # 1) DINO 토큰 추출 (GT/Render)
                 gt_chw     = pixels.permute(0, 3, 1, 2)    # [B,3,H,W], GT
                 render_chw = colors.permute(0, 3, 1, 2)    # [B,3,H,W], 렌더 결과
 
-                if mask_adaptation and (binary_mask is not None):
-                    mask_chw = binary_mask.permute(0, 3, 1, 2)   # [B,1,H,W], 마스크
-                    render_chw_safe = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw) # 마스크 영역은 렌더링 그래디언트가 안 흐르도록 처리
+                # The DINO model and upsampling head should be in eval mode and have gradients disabled.
+                # This is handled in the DinoFeatureExtractor constructor.
+                self.dino_extractor.dino_model.eval()
+                self.dino_head.eval()
 
-                # Extract GT tokens without gradient to save memory
+                # Prepare inputs for feature extraction
+                input_gt = gt_chw
+                input_render = render_chw
+                mask_chw = None
+                if mask_adaptation and binary_mask is not None:
+                    mask_chw = binary_mask.permute(0, 3, 1, 2).detach()
+                    # Apply mask to inputs. Detach render_chw for the non-masked region
+                    # to prevent gradients from flowing there.
+                    input_gt = gt_chw * mask_chw
+                    input_render = render_chw * mask_chw + render_chw.detach() * (1.0 - mask_chw)
+
+                # Extract GT features with no_grad for efficiency
                 with torch.no_grad():
-                    ftok,  Th, Tw, _, _  = self.dino_extractor.extract_tokens(gt_chw)
+                    ftok, Th, Tw, _, _ = self.dino_extractor.extract_tokens(input_gt)
 
-                # Extract render tokens with gradient enabled so dino_loss can backprop to render pixels -> splats
-                if mask_adaptation and (binary_mask is not None):
-                    fhtok, Th2, Tw2, _, _  = self.dino_extractor.extract_tokens(render_chw_safe)
-                else:
-                    fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(render_chw)
+                # Extract render features with gradients enabled to flow back to splats
+                fhtok, Th2, Tw2, _, _ = self.dino_extractor.extract_tokens(input_render)
 
                 assert (Th == Th2) and (Tw == Tw2), "DINO token grid mismatch between GT and Render"
                 B, _, C = ftok.shape
 
-                f_gt  = ftok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()   # [B,C,Th,Tw]
-                f_rnd = fhtok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()  # [B,C,Th,Tw]
+                f_gt = ftok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()
+                f_rnd = fhtok.view(B, Th, Tw, C).permute(0, 3, 1, 2).contiguous()
 
                 # 2) 업샘플 → 이미지 해상도 정렬
                 ps = self.dino_extractor.patch_size
                 Hpad, Wpad = Th * ps, Tw * ps
 
-                f_gt_up_pad  = F.interpolate(self.dino_head(f_gt),  size=(Hpad, Wpad), mode="bilinear", align_corners=False)
+                with torch.no_grad():
+                    f_gt_up_pad = F.interpolate(self.dino_head(f_gt), size=(Hpad, Wpad), mode="bilinear", align_corners=False)
                 f_rnd_up_pad = F.interpolate(self.dino_head(f_rnd), size=(Hpad, Wpad), mode="bilinear", align_corners=False)
 
                 # 오른쪽/아래만 패딩했으므로 좌상단 기준으로 원 해상도(H,W)로 자르기
                 H, W = colors.shape[1], colors.shape[2]
-                f_gt_up  = f_gt_up_pad[:,  :, :H, :W]   # [B,C,H,W]
-                f_rnd_up = f_rnd_up_pad[:, :, :H, :W]   # [B,C,H,W]
+                f_gt_up = f_gt_up_pad[:, :, :H, :W]
+                f_rnd_up = f_rnd_up_pad[:, :, :H, :W]
                 
+                # if step % 5000 == 0:
+                # # 'name' 변수 (예: 'image_001.png')는 이전에 정의되어 있어야 함
+                #     try:
+                #         # GT 특징 맵 시각화
+                #         gt_feat_img = self.visualize_features_pca(f_gt_up)
+                #         # Render 특징 맵 시각화
+                #         rnd_feat_img = self.visualize_features_pca(f_rnd_up)
+
+                #         # 저장할 디렉토리 생성
+                #         feat_dir = os.path.join(self.cfg.result_dir, "dino_features_pca")
+                #         os.makedirs(feat_dir, exist_ok=True)
+                        
+                #         # 파일명에 스텝(step)과 원본 파일명(name)을 포함하여 저장
+                #         save_name = f"{step:06d}_{name}"
+                #         imageio.imwrite(os.path.join(feat_dir, f"gt_{save_name}"), gt_feat_img)
+                #         imageio.imwrite(os.path.join(feat_dir, f"rnd_{save_name}"), rnd_feat_img)
+                #     except Exception as e:
+                #         print(f"[WARN] DINO feature visualization failed: {e}")
+
+
                 # 3) 코사인 불일치(=의미 차이) 맵 -> 배경(inlier) 영역에서만 정합 유도
                 cosd = 1.0 - F.cosine_similarity(f_gt_up, f_rnd_up, dim=1, eps=1e-6).unsqueeze(1)  # [B,1,H,W]
+
                 if mask_adaptation and (binary_mask is not None):
                     dino_feat_loss = (cosd * mask_chw).sum() / (mask_chw.sum() + 1e-8)
                 else:
                     # dino_feat_loss = (cosd).sum() / (binary_mask.sum() + 1e-8)  # [B,1,H,W]
-                    dino_feat_loss = (cosd).mean() #이게 맞는거 같은데
+
+                    # # [실험 3: 제안 (순수 플로터 페널티)]
+                    # # 1. 동적 마스크(dynamic_mask)를 정의합니다. (배경 1, 동적 0 -> 배경 0, 동적 1)
+                    # dynamic_mask = 1.0 - binary_mask.permute(0, 3, 1, 2).detach()
+                    # # 2. 동적 영역에서만 손실을 계산합니다.
+                    # dino_feat_loss = (cosd * dynamic_mask).sum() / (dynamic_mask.sum() + 1e-8)
+
+                    static_mask = binary_mask.permute(0, 3, 1, 2).detach()
+                    static_sum = static_mask.sum()
+                    total_pixels = static_mask.numel()
+
+                    # 분모가 전체 픽셀의 15%보다 작아지는 것을 방지
+                    min_denominator = total_pixels * 0.15 
+                    stable_denominator = torch.clamp(static_sum, min=min_denominator)
+
+                    dino_feat_loss = (cosd).sum() / (stable_denominator + 1e-8)
 
                 dino_loss =  dino_feat_loss
                 
